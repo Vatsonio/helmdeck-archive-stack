@@ -1,0 +1,128 @@
+# HELMDECK archive - self-contained Portainer stack.
+#
+# Paste this whole file into a Portainer stack. It needs NO repo files on the
+# host: the sink/ui images are pulled from GHCR (built by GitHub Actions), and the
+# MediaMTX config + disk-ring script are inlined as compose `configs`.
+#
+# The stack rides its OWN ZeroTier member (the `zerotier` service). mediamtx/sink/
+# ui share that member's network, so they are reachable at THIS stack's ZeroTier
+# IP - the address the operator stations archive to. After first deploy, AUTHORIZE
+# the new member in ZeroTier Central and note the IP it gets (that IP is what you
+# hardcode into the exe).
+#
+# Requires Docker Compose v2.23+ (for inline `configs: content`). Set ZT_NETWORK
+# if you ever change networks; UI_PORT is the only host-published port.
+
+name: helmdeck-archive
+
+services:
+  zerotier:
+    image: zerotier/zerotier:latest
+    container_name: helmdeck-zt
+    restart: unless-stopped
+    devices:
+      - /dev/net/tun
+    cap_add:
+      - NET_ADMIN
+      - SYS_ADMIN
+    volumes:
+      - zt_identity:/var/lib/zerotier-one
+    command: "${ZT_NETWORK:-88c5b1f339a56a50}"
+    # UI published on the host too (convenience); SRT/sink stay ZeroTier-only.
+    ports:
+      - "${UI_PORT:-8080}:8080"
+
+  mediamtx:
+    image: bluenviron/mediamtx:latest
+    restart: unless-stopped
+    network_mode: "service:zerotier"
+    depends_on: [zerotier]
+    configs:
+      - source: mediamtx_yml
+        target: /mediamtx.yml
+    volumes:
+      - archive_video:/rec
+
+  sink:
+    image: ghcr.io/vatsonio/helmdeck-archive-sink:latest
+    restart: unless-stopped
+    network_mode: "service:zerotier"
+    depends_on: [zerotier]
+    environment:
+      TELEM_ROOT: /telem
+    volumes:
+      - archive_telem:/telem
+
+  ui:
+    image: ghcr.io/vatsonio/helmdeck-archive-ui:latest
+    restart: unless-stopped
+    network_mode: "service:zerotier"
+    depends_on: [zerotier]
+    environment:
+      VIDEO_ROOT: /archive/video
+      TELEM_ROOT: /archive/telemetry
+    volumes:
+      - archive_video:/archive/video:ro
+      - archive_telem:/archive/telemetry:ro
+
+  diskring:
+    image: debian:stable-slim
+    restart: unless-stopped
+    environment:
+      THRESHOLD: "85"
+      LOW: "80"
+    configs:
+      - source: diskring_sh
+        target: /disk-ring.sh
+    volumes:
+      - archive_video:/archive/video
+      - archive_telem:/archive/telemetry
+    entrypoint: ["/bin/sh", "-c", "while true; do sh /disk-ring.sh; sleep 300; done"]
+
+configs:
+  mediamtx_yml:
+    content: |
+      logLevel: info
+      api: no
+      metrics: no
+      pprof: no
+      playback: no
+      rtsp: no
+      rtmp: no
+      hls: no
+      webrtc: no
+      srt: yes
+      srtAddress: :8890
+      pathDefaults:
+        record: no
+      paths:
+        "~^archive/.+$":
+          source: publisher
+          record: yes
+          recordPath: /rec/%path/%Y-%m-%d_%H-%M-%S-%f
+          recordFormat: mpegts
+          recordSegmentDuration: 10m
+          recordDeleteAfter: 720h
+  diskring_sh:
+    content: |
+      #!/bin/sh
+      set -eu
+      ROOT_V=/archive/video
+      ROOT_T=/archive/telemetry
+      THRESHOLD="${THRESHOLD:-85}"
+      LOW="${LOW:-80}"
+      usage() { df -P "$ROOT_V" | awk 'NR==2 {gsub("%","",$5); print $5}'; }
+      pct="$(usage)"
+      [ "$pct" -lt "$THRESHOLD" ] && exit 0
+      find "$ROOT_V" "$ROOT_T" -type f -mmin +1 -printf '%T@ %p\n' 2>/dev/null \
+        | sort -n | cut -d' ' -f2- | while IFS= read -r f; do
+            pct="$(usage)"
+            [ "$pct" -le "$LOW" ] && break
+            rm -f -- "$f"
+          done
+      find "$ROOT_V" "$ROOT_T" -mindepth 1 -type d -empty -delete 2>/dev/null || true
+
+volumes:
+  archive_video:
+  archive_telem:
+  zt_identity:
