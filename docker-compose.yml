@@ -6,12 +6,13 @@
 #
 # The stack rides its OWN ZeroTier member (the `zerotier` service). mediamtx/sink/
 # ui share that member's network, so they are reachable at THIS stack's ZeroTier
-# IP - the address the operator stations archive to. After first deploy, AUTHORIZE
+# IP (the address the operator stations archive to). After first deploy, AUTHORIZE
 # the new member in ZeroTier Central and note the IP it gets (that IP is what you
 # hardcode into the exe).
 #
-# Requires Docker Compose v2.23+ (for inline `configs: content`). Set ZT_NETWORK
-# if you ever change networks; UI_PORT is the only host-published port.
+# Video + telemetry are stored under ARCHIVE_DIR (default /data/helmdeck-archive,
+# the big 100G /data disk, NOT the small system disk). Requires Docker Compose
+# v2.23+ (for inline `configs: content`). UI_PORT is the only host-published port.
 
 name: helmdeck-archive
 
@@ -28,7 +29,6 @@ services:
     volumes:
       - zt_identity:/var/lib/zerotier-one
     command: "${ZT_NETWORK:-88c5b1f339a56a50}"
-    # UI published on the host too (convenience); SRT/sink stay ZeroTier-only.
     ports:
       - "${UI_PORT:-8080}:8080"
 
@@ -41,7 +41,7 @@ services:
       - source: mediamtx_yml
         target: /mediamtx.yml
     volumes:
-      - archive_video:/rec
+      - ${ARCHIVE_DIR:-/data/helmdeck-archive}/video:/rec
 
   sink:
     image: ghcr.io/vatsonio/helmdeck-archive-sink:latest
@@ -51,7 +51,7 @@ services:
     environment:
       TELEM_ROOT: /telem
     volumes:
-      - archive_telem:/telem
+      - ${ARCHIVE_DIR:-/data/helmdeck-archive}/telemetry:/telem
 
   ui:
     image: ghcr.io/vatsonio/helmdeck-archive-ui:latest
@@ -62,8 +62,8 @@ services:
       VIDEO_ROOT: /archive/video
       TELEM_ROOT: /archive/telemetry
     volumes:
-      - archive_video:/archive/video:ro
-      - archive_telem:/archive/telemetry:ro
+      - ${ARCHIVE_DIR:-/data/helmdeck-archive}/video:/archive/video:ro
+      - ${ARCHIVE_DIR:-/data/helmdeck-archive}/telemetry:/archive/telemetry:ro
 
   diskring:
     image: debian:stable-slim
@@ -75,8 +75,8 @@ services:
       - source: diskring_sh
         target: /disk-ring.sh
     volumes:
-      - archive_video:/archive/video
-      - archive_telem:/archive/telemetry
+      - ${ARCHIVE_DIR:-/data/helmdeck-archive}/video:/archive/video
+      - ${ARCHIVE_DIR:-/data/helmdeck-archive}/telemetry:/archive/telemetry
     entrypoint: ["/bin/sh", "-c", "while true; do sh /disk-ring.sh; sleep 300; done"]
 
 configs:
@@ -123,6 +123,4 @@ configs:
       find "$ROOT_V" "$ROOT_T" -mindepth 1 -type d -empty -delete 2>/dev/null || true
 
 volumes:
-  archive_video:
-  archive_telem:
   zt_identity:

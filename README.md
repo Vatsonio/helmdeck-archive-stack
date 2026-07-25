@@ -54,9 +54,9 @@ the tree.
 
 ## Notes
 
-- Recordings + telemetry live in named Docker volumes (`archive_video`,
-  `archive_telem`); the ZeroTier identity in `zt_identity` (keep it so the member
-  IP is stable across restarts). To store the archive on a specific large disk,
-  swap the named volumes for bind mounts.
+- Recordings + telemetry are bind-mounted under `ARCHIVE_DIR` (default
+  `/data/helmdeck-archive`, the big `/data` disk, NOT the small system disk). Set
+  `ARCHIVE_DIR` if your large disk is elsewhere. The ZeroTier identity lives in the
+  `zt_identity` named volume (keep it so the member IP is stable across restarts).
 - H.265 plays in the browser only on an HEVC-capable browser; otherwise use the
   UI's Export MP4.
