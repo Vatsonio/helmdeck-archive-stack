@@ -12,4 +12,8 @@ COPY app ./app
 
 # Container clock is UTC by default, matching the telemetry unix-ms timeline.
 EXPOSE 8080
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
+# --no-access-log: HLS playback issues one GET per segment per viewer and the
+# tree is polled every 30 s per open tab, so access logging is the loudest
+# writer on a host we share with other workloads.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080", \
+     "--no-access-log", "--limit-concurrency", "64"]

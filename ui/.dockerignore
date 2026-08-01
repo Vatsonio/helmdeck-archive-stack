@@ -1,0 +1,8 @@
+# The design preview page and its mock data are development aids. StaticFiles
+# serves whatever lands in app/static, so shipping them would publish a fake
+# archive at /preview.html next to the real one.
+app/static/preview.html
+app/static/mock.js
+__pycache__/
+**/__pycache__/
+*.pyc

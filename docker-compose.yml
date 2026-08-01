@@ -11,78 +11,145 @@
 # hardcode into the exe).
 #
 # Video + telemetry are stored under ARCHIVE_DIR (default /data/helmdeck-archive,
-# the big 100G /data disk, NOT the small system disk). Requires Docker Compose
-# v2.23+ (for inline `configs: content`). UI_PORT is the only host-published port.
+# the big data disk, NOT the small system disk). Requires Docker Compose v2.23+
+# (for inline `configs: content`).
+#
+# Reachability: the UI, the SRT ingest and the telemetry sink all live inside the
+# ZeroTier member's netns, so they are reachable at the ZT IP with NO host port
+# publishing at all. The host publish below is LOOPBACK ONLY, as a local escape
+# hatch; it deliberately does not put an unauthenticated archive viewer on a
+# public NIC, and it cannot collide with a neighbouring stack's port.
 
 name: helmdeck-archive
 
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   zerotier:
-    image: zerotier/zerotier:latest
+    image: zerotier/zerotier:1.14.2
     container_name: helmdeck-zt
     restart: unless-stopped
+    logging: *default-logging
     devices:
       - /dev/net/tun
     cap_add:
       - NET_ADMIN
       - SYS_ADMIN
     volumes:
+      # Losing identity.secret changes this member's ZeroTier address, and that
+      # address is hardcoded into every shipped exe. Keep this volume across
+      # redeploys, never tick "remove volumes" on a stack delete, and keep the
+      # backup described in the README. Moving it elsewhere MINTS A NEW IDENTITY
+      # unless you copy identity.secret to the new location first.
       - zt_identity:/var/lib/zerotier-one
     command: "${ZT_NETWORK:-88c5b1f339a56a50}"
     ports:
-      - "${UI_PORT:-8080}:8080"
+      - "127.0.0.1:${UI_PORT:-18080}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "zerotier-cli info | grep -q ONLINE"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    mem_limit: 256m
+    cpus: 0.5
 
   mediamtx:
-    image: bluenviron/mediamtx:latest
+    # Pinned deliberately. MediaMTX rejects unknown config keys outright and has
+    # renamed them before, so a floating tag turns a redeploy into a crash loop.
+    # 1.17.1+ is also REQUIRED here: it forbids path names that escape the
+    # recordings dir, and our path name comes from a publisher-supplied streamid.
+    image: bluenviron/mediamtx:1.19.3
     restart: unless-stopped
+    logging: *default-logging
     network_mode: "service:zerotier"
-    depends_on: [zerotier]
+    depends_on:
+      zerotier:
+        condition: service_healthy
+    environment:
+      TZ: UTC
     configs:
       - source: mediamtx_yml
         target: /mediamtx.yml
     volumes:
       - ${ARCHIVE_DIR:-/data/helmdeck-archive}/video:/rec
+    mem_limit: 512m
+    cpus: 1.0
 
   sink:
-    image: ghcr.io/vatsonio/helmdeck-archive-sink:latest
+    image: ghcr.io/vatsonio/helmdeck-archive-sink:${SINK_TAG:-latest}
     restart: unless-stopped
+    logging: *default-logging
     network_mode: "service:zerotier"
-    depends_on: [zerotier]
+    depends_on:
+      zerotier:
+        condition: service_healthy
     environment:
       TELEM_ROOT: /telem
+      TZ: UTC
     volumes:
       - ${ARCHIVE_DIR:-/data/helmdeck-archive}/telemetry:/telem
+    mem_limit: 256m
+    cpus: 0.5
+    security_opt:
+      - no-new-privileges:true
 
   ui:
-    image: ghcr.io/vatsonio/helmdeck-archive-ui:latest
+    image: ghcr.io/vatsonio/helmdeck-archive-ui:${UI_TAG:-latest}
     restart: unless-stopped
+    logging: *default-logging
     network_mode: "service:zerotier"
-    depends_on: [zerotier]
+    depends_on:
+      zerotier:
+        condition: service_healthy
     environment:
       VIDEO_ROOT: /archive/video
       TELEM_ROOT: /archive/telemetry
+      TZ: UTC
     volumes:
       - ${ARCHIVE_DIR:-/data/helmdeck-archive}/video:/archive/video:ro
       - ${ARCHIVE_DIR:-/data/helmdeck-archive}/telemetry:/archive/telemetry:ro
+    mem_limit: 1g
+    cpus: 1.5
+    # It forks ffprobe per segment and ffmpeg per export.
+    pids_limit: 256
+    security_opt:
+      - no-new-privileges:true
 
   diskring:
-    image: debian:stable-slim
+    image: debian:bookworm-slim
     restart: unless-stopped
+    logging: *default-logging
     environment:
       THRESHOLD: "85"
       LOW: "80"
+      # Never prune our own footprint below this (KiB). If the filesystem is full
+      # because of something that is NOT ours, deleting all our data cannot help.
+      MIN_KEEP_KIB: "5000000"
+      TZ: UTC
     configs:
       - source: diskring_sh
         target: /disk-ring.sh
     volumes:
       - ${ARCHIVE_DIR:-/data/helmdeck-archive}/video:/archive/video
       - ${ARCHIVE_DIR:-/data/helmdeck-archive}/telemetry:/archive/telemetry
-    entrypoint: ["/bin/sh", "-c", "while true; do sh /disk-ring.sh; sleep 300; done"]
+    entrypoint: ["/bin/sh", "-c", "while true; do sh /disk-ring.sh || echo 'diskring: cycle aborted'; sleep 300; done"]
+    mem_limit: 128m
+    cpus: 0.25
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  zt_identity:
 
 configs:
   mediamtx_yml:
     content: |
-      logLevel: info
+      logLevel: warn
       api: no
       metrics: no
       pprof: no
@@ -106,21 +173,59 @@ configs:
   diskring_sh:
     content: |
       #!/bin/sh
+      # Prune the OLDEST archive files when the volume passes THRESHOLD, down to
+      # LOW. Everything here is confined to the two bind mounts below.
+      #
+      # The percentage is parsed from `df`, so it MUST be validated before use:
+      # an unmounted or erroring filesystem makes `usage()` print nothing, and an
+      # empty string in `[ "$pct" -lt ... ]` is a shell ERROR, not a false. Under
+      # an AND-list that error does not stop the script, so an unguarded version
+      # skips the early exit AND never breaks out of the delete loop, i.e. it
+      # deletes the entire archive. Guard every read.
       set -eu
       ROOT_V=/archive/video
       ROOT_T=/archive/telemetry
       THRESHOLD="${THRESHOLD:-85}"
       LOW="${LOW:-80}"
+      MIN_KEEP_KIB="${MIN_KEEP_KIB:-5000000}"
+
       usage() { df -P "$ROOT_V" | awk 'NR==2 {gsub("%","",$5); print $5}'; }
-      pct="$(usage)"
+      own_kib() { du -s -k "$ROOT_V" "$ROOT_T" | awk '{s+=$1} END {print s+0}'; }
+      is_num() { case "${1:-}" in '' | *[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+
+      pct="$(usage || true)"
+      if ! is_num "$pct"; then
+        echo "diskring: cannot read df for $ROOT_V (got '$pct'); doing nothing" >&2
+        exit 1
+      fi
       [ "$pct" -lt "$THRESHOLD" ] && exit 0
-      find "$ROOT_V" "$ROOT_T" -type f -mmin +1 -printf '%T@ %p\n' 2>/dev/null \
+
+      own="$(own_kib || true)"
+      if ! is_num "$own"; then
+        echo "diskring: cannot size the archive; doing nothing" >&2
+        exit 1
+      fi
+      if [ "$own" -le "$MIN_KEEP_KIB" ]; then
+        echo "diskring: ${pct}% full but only ${own} KiB is ours; not our disk to free" >&2
+        exit 0
+      fi
+
+      echo "diskring: ${pct}% full, pruning oldest down to ${LOW}%"
+      # Re-check df every RECHECK deletions rather than every file: on a
+      # fragmented archive the per-file version forks df thousands of times.
+      RECHECK=25
+      i=0
+      find "$ROOT_V" "$ROOT_T" -type f -mmin +60 -printf '%T@ %p\n' 2>/dev/null \
         | sort -n | cut -d' ' -f2- | while IFS= read -r f; do
-            pct="$(usage)"
-            [ "$pct" -le "$LOW" ] && break
+            if [ "$i" -eq 0 ]; then
+              pct="$(usage || true)"
+              is_num "$pct" || exit 1
+              [ "$pct" -le "$LOW" ] && break
+              own="$(own_kib || true)"
+              is_num "$own" || exit 1
+              [ "$own" -le "$MIN_KEEP_KIB" ] && break
+            fi
             rm -f -- "$f"
+            i=$(( (i + 1) % RECHECK ))
           done
       find "$ROOT_V" "$ROOT_T" -mindepth 1 -type d -empty -delete 2>/dev/null || true
-
-volumes:
-  zt_identity:
