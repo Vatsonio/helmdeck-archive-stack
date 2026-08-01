@@ -8,65 +8,103 @@
 </head>
 <body>
 <div id="app">
+
   <aside id="sidebar">
     <div id="brand">
       <div id="brandDot"></div>
       <div>
         <h1>HELMDECK</h1>
-        <div class="sub">ARCHIVE VIEWER</div>
+        <div class="sub">ARCHIVE</div>
       </div>
     </div>
     <div id="tree"><div class="empty">LOADING</div></div>
     <div id="mapPanel" hidden>
-      <div class="head"><span>TRACK</span><span id="mapCoord" class="mono"></span></div>
+      <div class="head"><span>TRACK</span><span id="mapCoord"></span></div>
       <canvas id="map"></canvas>
     </div>
   </aside>
 
   <main id="main">
-    <header id="topbar">
-      <div id="crumb" class="none">NO SELECTION</div>
-      <div id="spacer"></div>
-      <button id="osdBtn" class="on" type="button" title="OSD overlay">OSD</button>
-      <button id="mapBtn" class="on" type="button" title="Track map">MAP</button>
-      <div class="sep"></div>
-      <select id="rate" title="Playback speed">
-        <option value="0.25">0.25x</option>
-        <option value="0.5">0.5x</option>
-        <option value="1" selected>1x</option>
-        <option value="2">2x</option>
-        <option value="4">4x</option>
-        <option value="8">8x</option>
-      </select>
-      <div class="sep"></div>
-      <button id="inBtn" type="button" disabled title="Set clip IN (I)">IN</button>
-      <button id="outBtn" type="button" disabled title="Set clip OUT (O)">OUT</button>
-      <span id="clipLbl" class="mono dim"></span>
-      <button id="clipClr" type="button" hidden title="Clear clip">CLR</button>
-      <div class="sep"></div>
-      <a id="dlSeg" class="btn" hidden title="Download the segment under the playhead">SEG</a>
-      <a id="exportBtn" class="btn go" hidden>EXPORT</a>
-      <button id="keysBtn" type="button" title="Keyboard shortcuts">?</button>
-    </header>
 
     <section id="stage">
       <video id="video" playsinline></video>
-      <canvas id="osd"></canvas>
+
+      <!-- OSD: the operator station's layout, replayed from the recorded log -->
+      <div id="osd">
+        <div id="compass"><canvas id="compassC"></canvas></div>
+
+        <div class="panel panel-left" id="panelL">
+          <div class="panel-head"><span class="ttl">FLIGHT</span><span class="meta" id="lnkMeta">-</span></div>
+          <div class="mode-row"><span class="lbl">MODE</span><span class="mode-val" id="vMode">-</span></div>
+          <div class="armed-row" id="armRow"><span class="lbl">ARM&nbsp;STATE</span><span class="arm-val" id="vArm">-</span></div>
+          <div class="hr"></div>
+          <div class="metric-row"><span class="lbl">SPD</span><span><span class="v" id="vSpd">-</span><span class="u">KM/H</span></span></div>
+          <div class="metric-row"><span class="lbl">HDG</span><span><span class="v" id="vHdg">-</span><span class="u">&deg; MAG</span></span></div>
+          <div class="metric-row"><span class="lbl">ALT</span><span><span class="v" id="vAlt">-</span><span class="u">M&nbsp;AGL</span></span></div>
+          <div class="hr"></div>
+          <div class="tilt-head"><span class="lbl">TILT</span><span class="vals" id="vTilt">-</span></div>
+          <canvas id="tilt"></canvas>
+        </div>
+
+        <div class="panel panel-right" id="panelR">
+          <div class="panel-head"><span class="ttl">POWER</span></div>
+          <div class="hero-wrap"><span class="hero" id="vBattV">-</span><span class="unit">V&nbsp;PACK</span></div>
+          <div class="batt-bar"><i id="battBar"></i></div>
+          <div class="batt-meta"><span id="vBattA">-</span>A<span class="sep">|</span><span id="vBattPct">-</span></div>
+          <div class="hr"></div>
+          <div class="panel-head"><span class="ttl">GPS</span></div>
+          <div class="inline"><span class="glyph">&#9672;</span><span id="vFix">-</span><span class="sep">|</span><span id="vSats">-</span><span class="u">SAT</span><span class="sep">|</span>HDOP&nbsp;<span id="vHdop">-</span></div>
+          <div class="hr"></div>
+          <div class="panel-head"><span class="ttl">MISSION</span></div>
+          <div class="mh-row"><span class="lbl">CURRENT&nbsp;WP</span><span class="v" id="vWp">-</span></div>
+          <div class="mh-row"><span class="lbl">WP&nbsp;DIST</span><span class="v" id="vWpD">-</span></div>
+          <div class="mh-row"><span class="lbl">HOME&nbsp;DIST</span><span class="v" id="vHome">-</span></div>
+        </div>
+
+        <div id="coordStrip">
+          <div class="chunk"><span class="lbl">POS</span><span id="vLat">-</span><span class="mid">&middot;</span><span id="vLon">-</span></div>
+          <div class="chunk"><span class="lbl">UTC</span><span id="vUtc">-</span></div>
+          <div class="chunk"><span class="lbl">SRC</span><span id="vSrc">-</span></div>
+        </div>
+      </div>
+
       <div id="notice" class="overlay" hidden></div>
-      <div id="empty" class="overlay">PICK A RECORDING</div>
+      <div id="empty" class="overlay">SELECT A RECORDING</div>
     </section>
 
     <div id="transport">
-      <div id="timeline" title="Click to seek">
+      <div id="timeline" title="Click or drag to seek">
         <canvas id="tlCanvas"></canvas>
         <div id="tlHead" hidden></div>
+        <div id="tlHover" hidden></div>
       </div>
       <div id="tlRow">
-        <span id="clock" class="mono">--:--:--<span class="ms">.--</span></span>
-        <span id="rel" class="mono"></span>
-        <span id="spacer2" style="flex:1 1 auto"></span>
-        <span id="segNow" class="mono"></span>
+        <button id="playBtn" class="tr" type="button" title="Play / pause (SPACE)">&#9654;</button>
+        <button id="prevBtn" class="tr" type="button" title="Previous segment ([)">&#10094;&#10094;</button>
+        <button id="nextBtn" class="tr" type="button" title="Next segment (])">&#10095;&#10095;</button>
+        <span id="clock">--:--:--<span class="ms">.--</span></span>
+        <span id="rel"></span>
+        <span class="grow"></span>
+        <select id="rate" title="Playback speed">
+          <option value="0.25">0.25x</option>
+          <option value="0.5">0.5x</option>
+          <option value="1" selected>1x</option>
+          <option value="2">2x</option>
+          <option value="4">4x</option>
+          <option value="8">8x</option>
+        </select>
+        <button id="osdBtn" class="on" type="button" title="OSD overlay">OSD</button>
+        <button id="mapBtn" class="on" type="button" title="Track map">MAP</button>
+        <span class="sep"></span>
+        <button id="inBtn" type="button" disabled title="Clip in (I)">IN</button>
+        <button id="outBtn" type="button" disabled title="Clip out (O)">OUT</button>
+        <span id="clipLbl"></span>
+        <button id="clipClr" type="button" hidden title="Clear clip">CLR</button>
+        <a id="dlSeg" class="btn" hidden title="Download the segment under the playhead">SEG</a>
+        <a id="exportBtn" class="btn go" hidden>EXPORT</a>
+        <button id="keysBtn" type="button" title="Keys">?</button>
       </div>
+      <div id="segNow"></div>
     </div>
 
     <footer id="graphPanel">
@@ -86,9 +124,9 @@
       <tr><td>[ / ]</td><td>previous, next segment</td></tr>
       <tr><td>, / .</td><td>frame step while paused</td></tr>
       <tr><td>I / O</td><td>clip in, clip out</td></tr>
-      <tr><td>ESC</td><td>close this</td></tr>
+      <tr><td>ESC</td><td>close</td></tr>
     </table>
-    <div class="hint">Timeline: click to seek. Graph: click to seek.</div>
+    <div class="hint">Timeline: click or drag to seek. Graph: click to seek.</div>
   </div>
 </div>
 
