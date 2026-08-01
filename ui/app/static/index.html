@@ -13,84 +13,85 @@
       <div id="brandDot"></div>
       <div>
         <h1>HELMDECK</h1>
-        <div class="sub">ARCHIVE VIEWER · GCS</div>
+        <div class="sub">ARCHIVE VIEWER</div>
       </div>
     </div>
-    <div id="tree"></div>
+    <div id="tree"><div class="empty">LOADING</div></div>
     <div id="mapPanel" hidden>
-      <div class="mphead"><span class="lbl">TRACK</span><span id="mapCoord" class="mono"></span></div>
+      <div class="head"><span>TRACK</span><span id="mapCoord" class="mono"></span></div>
       <canvas id="map"></canvas>
     </div>
   </aside>
+
   <main id="main">
     <header id="topbar">
-      <div id="crumb" class="mono none">NO SELECTION</div>
-      <div id="controls">
-        <button id="osdToggle" class="tog on" type="button" title="OSD overlay">OSD</button>
-        <button id="mapToggle" class="tog on" type="button" title="Track map">MAP</button>
-        <button id="cmpBtn" class="tog" type="button" disabled title="Compare second camera side-by-side">CMP</button>
-        <select id="rate" class="mono" title="Playback speed">
-          <option value="0.25">0.25×</option><option value="0.5">0.5×</option>
-          <option value="1" selected>1×</option><option value="2">2×</option>
-          <option value="4">4×</option><option value="8">8×</option>
-        </select>
-        <label id="syncCtl"><span class="lbl">SYNC</span>
-          <input type="range" id="sync" min="-30" max="30" step="0.5" value="0">
-          <output id="syncVal" class="mono">+0.0s</output>
-        </label>
-        <span id="buf" class="mono" hidden></span>
-        <span id="segInfo" class="mono" hidden>
-          <span id="segLabel"></span><a id="segDl" title="Download this segment">↓</a>
-        </span>
-        <span id="clipCtl" class="mono" hidden>
-          <button id="setIn" class="mini" type="button" title="Set clip IN (key I)">I</button>
-          <button id="setOut" class="mini" type="button" title="Set clip OUT (key O)">O</button>
-          <span id="clipLbl"></span>
-          <a id="clipBtn" class="btn ghost" hidden>CLIP</a>
-          <button id="clipClear" class="mini" type="button" hidden title="Clear clip">✕</button>
-        </span>
-        <button id="copyBtn" class="tog" type="button" disabled title="Copy timestamp + coordinates">POS</button>
-        <button id="frameBtn" class="tog" type="button" disabled title="Save frame + OSD as PNG">FRAME</button>
-        <button id="keysBtn" class="tog" type="button" title="Keyboard shortcuts">?</button>
-        <a id="exportBtn" class="btn" hidden>EXPORT MP4</a>
-      </div>
+      <div id="crumb" class="none">NO SELECTION</div>
+      <div id="spacer"></div>
+      <button id="osdBtn" class="on" type="button" title="OSD overlay">OSD</button>
+      <button id="mapBtn" class="on" type="button" title="Track map">MAP</button>
+      <div class="sep"></div>
+      <select id="rate" title="Playback speed">
+        <option value="0.25">0.25x</option>
+        <option value="0.5">0.5x</option>
+        <option value="1" selected>1x</option>
+        <option value="2">2x</option>
+        <option value="4">4x</option>
+        <option value="8">8x</option>
+      </select>
+      <div class="sep"></div>
+      <button id="inBtn" type="button" disabled title="Set clip IN (I)">IN</button>
+      <button id="outBtn" type="button" disabled title="Set clip OUT (O)">OUT</button>
+      <span id="clipLbl" class="mono dim"></span>
+      <button id="clipClr" type="button" hidden title="Clear clip">CLR</button>
+      <div class="sep"></div>
+      <a id="dlSeg" class="btn" hidden title="Download the segment under the playhead">SEG</a>
+      <a id="exportBtn" class="btn go" hidden>EXPORT</a>
+      <button id="keysBtn" type="button" title="Keyboard shortcuts">?</button>
     </header>
+
     <section id="stage">
-      <div id="videowrap">
-        <video id="video" controls playsinline></video>
-        <canvas id="osd"></canvas>
-        <div class="paneLabel mono" id="cam1label" hidden></div>
-        <div id="notice" class="mono overlay" hidden></div>
-        <div id="empty" class="mono overlay">PICK A RECORDING</div>
-      </div>
-      <div id="videowrap2" hidden>
-        <video id="video2" muted playsinline></video>
-        <div class="paneLabel mono" id="cam2label"></div>
-      </div>
+      <video id="video" playsinline></video>
+      <canvas id="osd"></canvas>
+      <div id="notice" class="overlay" hidden></div>
+      <div id="empty" class="overlay">PICK A RECORDING</div>
     </section>
+
+    <div id="transport">
+      <div id="timeline" title="Click to seek">
+        <canvas id="tlCanvas"></canvas>
+        <div id="tlHead" hidden></div>
+      </div>
+      <div id="tlRow">
+        <span id="clock" class="mono">--:--:--<span class="ms">.--</span></span>
+        <span id="rel" class="mono"></span>
+        <span id="spacer2" style="flex:1 1 auto"></span>
+        <span id="segNow" class="mono"></span>
+      </div>
+    </div>
+
     <footer id="graphPanel">
       <canvas id="graph"></canvas>
-      <div id="legend" class="mono"></div>
+      <div id="legend"></div>
     </footer>
   </main>
 </div>
+
 <div id="keys" hidden>
   <div id="keysBox">
     <h2>KEYBOARD</h2>
     <table>
-      <tr><td>SPACE / K</td><td>play · pause</td></tr>
-      <tr><td>← / →</td><td>±5 s</td></tr>
-      <tr><td>SHIFT ← / →</td><td>±60 s</td></tr>
-      <tr><td>[ / ]</td><td>prev · next segment</td></tr>
-      <tr><td>J</td><td>−10 s</td></tr>
-      <tr><td>L</td><td>speed up (cycles)</td></tr>
-      <tr><td>, / .</td><td>frame step (paused)</td></tr>
-      <tr><td>I / O</td><td>clip in · out</td></tr>
-      <tr><td>?</td><td>this help</td></tr>
+      <tr><td>SPACE / K</td><td>play, pause</td></tr>
+      <tr><td>&larr; / &rarr;</td><td>5 s</td></tr>
+      <tr><td>SHIFT &larr; / &rarr;</td><td>60 s</td></tr>
+      <tr><td>[ / ]</td><td>previous, next segment</td></tr>
+      <tr><td>, / .</td><td>frame step while paused</td></tr>
+      <tr><td>I / O</td><td>clip in, clip out</td></tr>
+      <tr><td>ESC</td><td>close this</td></tr>
     </table>
-    <div class="hint">Graph: click = seek · drag = zoom · wheel = zoom · dblclick = reset</div>
+    <div class="hint">Timeline: click to seek. Graph: click to seek.</div>
   </div>
 </div>
+
 <script src="/vendor/hls.min.js"></script>
 <script src="app.js"></script>
 </body>

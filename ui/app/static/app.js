@@ -1,656 +1,619 @@
+/* HELMDECK archive viewer.
+ *
+ * Playback model: the server publishes every recording as an HLS VOD playlist of
+ * fragmented-MP4 segments (hvc1), so hls.js only ever has to push fMP4 into MSE.
+ * That is the only shape a browser can decode H.265 in; the previous build fed
+ * it HEVC inside MPEG-TS, which hls.js rejects outright ("Unsupported HEVC in
+ * M2TS found"), so nothing ever played.
+ *
+ * Two clocks run side by side and must not be confused:
+ *   - PLAYBACK time, `video.currentTime`, is continuous across a recording gap.
+ *   - WALL time is what telemetry, the OSD and clip export are keyed by.
+ * `wallAt()` / `playbackAt()` convert between them using the segment table,
+ * which carries both.
+ */
+
 'use strict';
-const $=s=>document.querySelector(s);
-const enc=encodeURIComponent;
-const video=$('#video'),video2=$('#video2'),wrap=$('#videowrap'),wrap2=$('#videowrap2'),
-      osd=$('#osd'),gc=$('#graph'),stage=$('#stage'),mapC=$('#map');
 
-const WHITE='#f2efe9',GREEN='#6fcf7a',RED='#e04a3a',YELLOW='#e0b02f',BLUE='#5aa7d6',GOLD='#c9a24a',DIM='#9a8d78',FAINT='#5a5044';
-const CH=[
-  {f:'speed_kmh',l:'SPD km/h',c:WHITE,fix:1},
-  {f:'battery_pct',l:'BAT %',c:GREEN,max:100,fix:0},
-  {f:'alt_m',l:'ALT m',c:BLUE,fix:1},
-  {f:'elrs_lq_pct',l:'LQ %',c:GOLD,max:100,fix:0},
-  {f:'mavlink_loss_pct',l:'LOSS %',c:RED,fix:1},
-];
-const RATES=[0.25,0.5,1,2,4,8];
-
-const state={
-  tree:[],expanded:new Set(),firstTree:true,active:null,
-  segs:[],totalDur:0,range:null,view:null,gaps:[],
-  samples:[],merged:[],markers:[],telemFail:false,
-  sync:0,osdOn:true,mapOn:true,cmpOn:false,otherCam:null,
-  hls:null,hls2:null,
-  graphBase:null,mapBase:null,mapProj:null,hover:null,drag:null,
-  inW:null,outW:null,pendingSeek:null,
-  chOn:new Set(['speed_kmh','battery_pct']),
+const $ = (id) => document.getElementById(id);
+const el = {
+  tree: $('tree'), crumb: $('crumb'), video: $('video'), osd: $('osd'),
+  notice: $('notice'), empty: $('empty'),
+  timeline: $('timeline'), tlCanvas: $('tlCanvas'), tlHead: $('tlHead'),
+  clock: $('clock'), rel: $('rel'), segNow: $('segNow'),
+  map: $('map'), mapPanel: $('mapPanel'), mapCoord: $('mapCoord'),
+  graph: $('graph'), legend: $('legend'),
+  osdBtn: $('osdBtn'), mapBtn: $('mapBtn'), rate: $('rate'),
+  inBtn: $('inBtn'), outBtn: $('outBtn'), clipLbl: $('clipLbl'), clipClr: $('clipClr'),
+  dlSeg: $('dlSeg'), exportBtn: $('exportBtn'),
+  keys: $('keys'), keysBtn: $('keysBtn'),
 };
 
-async function fetchJSON(url){const r=await fetch(url);if(!r.ok)throw new Error(r.status+' '+url);return r.json();}
-const tfmt=w=>new Date(w).toISOString().slice(11,19)+'Z';
-const nice=v=>{if(!(v>0))return 1;const p=Math.pow(10,Math.floor(Math.log10(v)));for(const m of[1,2,5,10])if(m*p>=v)return m*p;return 10*p;};
+const S = {
+  sel: null,           // {node, cam, day}
+  segments: [],        // [{start_ms, dur, cum, path, disc}]
+  totalDur: 0,
+  telemetry: [],       // [{t, p}] for the whole selection, sorted by t
+  hls: null,
+  showOsd: true,
+  showMap: true,
+  clipIn: null,        // wall ms
+  clipOut: null,
+};
 
-/* ---------------- tree ---------------- */
-async function loadTree(){
+const api = async (path) => {
+  const r = await fetch(path);
+  if (!r.ok) throw new Error(`${r.status} on ${path.split('?')[0]}`);
+  return r.json();
+};
+const pad = (n, w = 2) => String(n).padStart(w, '0');
+const selKey = (s) => s && `${s.node}/${s.cam}/${s.day}`;
+
+const hhmmss = (ms) => {
+  const d = new Date(ms);
+  return `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
+};
+const hms = (sec) => {
+  sec = Math.max(0, Math.floor(sec));
+  return `${pad(Math.floor(sec / 3600))}:${pad(Math.floor(sec / 60) % 60)}:${pad(sec % 60)}`;
+};
+
+/* --- the two clocks ------------------------------------------------------ */
+
+/** Wall-clock ms for a playback offset. */
+function wallAt(t) {
+  const segs = S.segments;
+  if (!segs.length) return 0;
+  for (let i = segs.length - 1; i >= 0; i--) {
+    if (t >= segs[i].cum - 1e-6) return segs[i].start_ms + (t - segs[i].cum) * 1000;
+  }
+  return segs[0].start_ms;
+}
+
+/** Playback offset for a wall-clock ms. A time inside a recording gap maps to
+ *  the start of the next segment, which is where playback actually resumes. */
+function playbackAt(wallMs) {
+  const segs = S.segments;
+  if (!segs.length) return 0;
+  for (const s of segs) {
+    if (wallMs < s.start_ms) return s.cum;
+    if (wallMs <= s.start_ms + s.dur * 1000) return s.cum + (wallMs - s.start_ms) / 1000;
+  }
+  return S.totalDur;
+}
+
+function segmentAt(t) {
+  const segs = S.segments;
+  for (let i = segs.length - 1; i >= 0; i--) if (t >= segs[i].cum - 1e-6) return segs[i];
+  return segs[0] || null;
+}
+
+/* --- capability ---------------------------------------------------------- */
+
+/** Can this browser decode our recordings at all? Answered up front, because a
+ *  silent black frame is the worst possible failure mode for a viewer. */
+function hevcSupport() {
+  if (!window.MediaSource || !window.MediaSource.isTypeSupported) {
+    return { ok: false, why: 'This browser has no Media Source Extensions.' };
+  }
+  const ok = [
+    'video/mp4; codecs="hvc1.1.6.L120.B0"',
+    'video/mp4; codecs="hvc1.2.4.L120.B0"',
+    'video/mp4; codecs="hev1.1.6.L120.B0"',
+  ].some((t) => window.MediaSource.isTypeSupported(t));
+  return ok ? { ok: true } : {
+    ok: false,
+    why: 'This browser cannot decode H.265 (HEVC).',
+    hint: 'Chrome on Windows decodes it with no extra software. Edge needs the ' +
+          'Microsoft HEVC Video Extension. Either way EXPORT still gives you a ' +
+          'file that plays in VLC or any desktop player.',
+  };
+}
+
+function notice(html) {
+  if (!html) { el.notice.hidden = true; return; }
+  el.notice.innerHTML = html;
+  el.notice.hidden = false;
+}
+
+/* --- archive tree -------------------------------------------------------- */
+
+async function loadTree() {
   let data;
-  try{data=await fetchJSON('/api/tree');}
-  catch(e){if(!state.tree.length)$('#tree').innerHTML='<div class="msg err">LINK DOWN — RETRYING</div>';return;}
-  state.tree=data.nodes||[];
-  const first=state.firstTree;
-  if(first){
-    for(const n of state.tree){state.expanded.add('n:'+n.node);for(const c of n.cameras||[])state.expanded.add('c:'+n.node+'/'+c.cam);}
-    state.firstTree=false;
+  try {
+    data = await api('/api/tree');
+  } catch (e) {
+    el.tree.innerHTML = `<div class="empty">ARCHIVE UNREACHABLE<br><br>${e.message}</div>`;
+    return;
   }
-  renderTree();
-  if(first&&!state.active){
-    const hp=parseHash();
-    if(hp){state.pendingSeek=hp.t||0;selectDay(hp.node,hp.cam,hp.day);}
+  if (!data.nodes.length) {
+    el.tree.innerHTML = '<div class="empty">NO RECORDINGS YET<br><br>' +
+      'Operator stations publish here<br>automatically while they stream.</div>';
+    return;
   }
-}
-function renderTree(){
-  const el=$('#tree');
-  if(!state.tree.length){el.innerHTML='<div class="msg">NO RECORDINGS YET</div>';return;}
-  const a=state.active,h=[];
-  const esc=s=>String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');
-  for(const n of state.tree){
-    const nk='n:'+n.node,nOpen=state.expanded.has(nk);
-    h.push(`<button class="trow nrow" data-k="${esc(nk)}"><span class="arrow">${nOpen?'▾':'▸'}</span>${esc(n.node)}</button>`);
-    if(!nOpen)continue;
-    for(const c of n.cameras||[]){
-      const ck='c:'+n.node+'/'+c.cam,cOpen=state.expanded.has(ck);
-      h.push(`<button class="trow crow" data-k="${esc(ck)}"><span class="arrow">${cOpen?'▾':'▸'}</span>${esc(c.cam)}</button>`);
-      if(!cOpen)continue;
-      for(const d of c.days||[]){
-        const act=a&&a.node===n.node&&a.cam===c.cam&&a.day===d.day;
-        h.push(`<button class="trow drow${act?' active':''}" data-day="1" data-node="${esc(n.node)}" data-cam="${esc(c.cam)}" data-d="${esc(d.day)}"><span>${esc(d.day)}</span><span class="count">${d.segments} seg</span></button>`);
+  const frag = document.createDocumentFragment();
+  for (const n of data.nodes) {
+    const nd = document.createElement('div');
+    nd.className = 'node';
+    nd.textContent = n.node;
+    frag.appendChild(nd);
+    for (const c of n.cameras) {
+      const cd = document.createElement('div');
+      cd.className = 'cam';
+      cd.textContent = c.cam;
+      frag.appendChild(cd);
+      for (const d of c.days) {
+        const dd = document.createElement('div');
+        dd.className = 'day';
+        dd.dataset.key = `${n.node}/${c.cam}/${d.day}`;
+        const day = document.createElement('span');
+        day.textContent = d.day;
+        const cnt = document.createElement('span');
+        cnt.className = 'n';
+        cnt.textContent = d.segments;
+        dd.append(day, cnt);
+        dd.onclick = () => select(n.node, c.cam, d.day);
+        frag.appendChild(dd);
       }
     }
   }
-  el.innerHTML=h.join('');
-}
-$('#tree').addEventListener('click',e=>{
-  const b=e.target.closest('.trow');if(!b)return;
-  if(b.dataset.day){selectDay(b.dataset.node,b.dataset.cam,b.dataset.d);return;}
-  const k=b.dataset.k;
-  state.expanded.has(k)?state.expanded.delete(k):state.expanded.add(k);
-  renderTree();
-});
-
-/* ---------------- deep link ---------------- */
-function parseHash(){
-  const m=location.hash.match(/^#([^/]+)\/([^/]+)\/([^/?]+)(?:\?t=([\d.]+))?/);
-  if(!m)return null;
-  return {node:decodeURIComponent(m[1]),cam:decodeURIComponent(m[2]),day:decodeURIComponent(m[3]),t:m[4]?+m[4]:0};
-}
-let lastHash=0;
-function writeHash(){
-  const a=state.active;if(!a||!state.segs.length)return;
-  history.replaceState(null,'',`#${enc(a.node)}/${enc(a.cam)}/${enc(a.day)}?t=${video.currentTime.toFixed(1)}`);
+  el.tree.replaceChildren(frag);
+  markSelected();
 }
 
-/* ---------------- selection ---------------- */
-async function selectDay(node,cam,day){
-  state.active={node,cam,day};
-  state.segs=[];state.samples=[];state.merged=[];state.markers=[];state.range=null;state.view=null;
-  state.gaps=[];state.graphBase=null;state.mapBase=null;state.telemFail=false;state.inW=null;state.outW=null;
-  renderTree();updateClipUI();
-  $('#crumb').classList.remove('none');
-  $('#crumb').innerHTML=`${node} <span class="sep">/</span> ${cam} <span class="sep">/</span> ${day}`;
-  $('#empty').hidden=true;$('#notice').hidden=true;
-  const ex=$('#exportBtn');ex.hidden=false;ex.href=`/api/export?node=${enc(node)}&cam=${enc(cam)}&day=${enc(day)}`;
-  $('#copyBtn').disabled=false;$('#frameBtn').disabled=false;
-  $('#clipCtl').hidden=false;$('#buf').hidden=false;
-  updateCmpAvail();
-  let segRes;
-  try{segRes=await fetchJSON(`/api/segments?node=${enc(node)}&cam=${enc(cam)}&day=${enc(day)}`);}
-  catch(e){notice('FAILED TO LOAD SEGMENT INDEX');return;}
-  state.segs=segRes.segments||[];
-  state.totalDur=segRes.total_dur||0;
-  if(!state.segs.length){notice('NO SEGMENTS IN THIS RECORDING');return;}
-  const last=state.segs[state.segs.length-1];
-  state.range=[state.segs[0].start_ms,last.start_ms+last.dur*1000];
-  state.view=[...state.range];
-  state.gaps=[];
-  for(let i=0;i<state.segs.length-1;i++){
-    const e0=state.segs[i].start_ms+state.segs[i].dur*1000,s1=state.segs[i+1].start_ms;
-    if(s1-e0>1500)state.gaps.push([e0,s1]);
-  }
-  attachHls(`/api/hls?node=${enc(node)}&cam=${enc(cam)}&day=${enc(day)}`);
-  if(state.pendingSeek){const t=state.pendingSeek;state.pendingSeek=null;
-    try{video.currentTime=t;}catch(e){}
-    video.addEventListener('loadedmetadata',()=>{try{video.currentTime=t;}catch(e){}},{once:true});
-  }
-  if(state.cmpOn)setCmp(true); // reattach second cam for new day
-  writeHash();
-  loadTelemetry(node,state.range[0]-35000,state.range[1]+35000);
-}
-function notice(msg){const n=$('#notice');n.textContent=msg;n.hidden=false;}
-
-async function loadTelemetry(node,start,end){
-  try{
-    const res=await fetchJSON(`/api/telemetry?node=${enc(node)}&start=${Math.floor(start)}&end=${Math.ceil(end)}`);
-    state.samples=res.samples||[];
-    const merged=[];let cur={};
-    for(const s of state.samples){cur=Object.assign({},cur,s.p);merged.push(cur);}
-    state.merged=merged;
-    computeMarkers();
-  }catch(e){state.samples=[];state.merged=[];state.telemFail=true;}
-  state.graphBase=null;state.mapBase=null;
-}
-function computeMarkers(){
-  const M=[];const prev={};
-  for(const s of state.samples){
-    const p=s.p;
-    if(p.mode!=null&&prev.mode!=null&&p.mode!==prev.mode)M.push({t:s.t,c:WHITE,l:'MODE '+String(p.mode).toUpperCase()});
-    if(p.armed!=null&&prev.armed!=null&&p.armed!==prev.armed)M.push({t:s.t,c:p.armed?RED:GREEN,l:p.armed?'ARMED':'DISARMED'});
-    if(p.elrs_lq_pct!=null&&prev.elrs_lq_pct!=null&&p.elrs_lq_pct<40&&prev.elrs_lq_pct>=40)M.push({t:s.t,c:YELLOW,l:'LQ LOW '+Math.round(p.elrs_lq_pct)+'%'});
-    if(p.gps_fix!=null&&prev.gps_fix!=null&&p.gps_fix!==prev.gps_fix)M.push({t:s.t,c:/3D|RTK/i.test(p.gps_fix)?GREEN:YELLOW,l:'GPS '+p.gps_fix});
-    Object.assign(prev,p);
-  }
-  state.markers=M;
-}
-
-/* ---------------- hls ---------------- */
-function attachHls(url){
-  if(state.hls){state.hls.destroy();state.hls=null;}
-  video.removeAttribute('src');video.load();
-  const H=window.Hls;
-  if(H&&H.isSupported()){
-    state.hls=new H();
-    state.hls.on(H.Events.ERROR,(_,d)=>{if(d.fatal)notice('STREAM ERROR: '+d.type);});
-    state.hls.loadSource(url);state.hls.attachMedia(video);
-  }else if(video.canPlayType('application/vnd.apple.mpegurl')){
-    video.src=url;
-  }else{
-    notice('HEVC / HLS PLAYBACK NOT SUPPORTED IN THIS BROWSER');
-  }
-}
-video.addEventListener('playing',()=>{$('#notice').hidden=true;});
-
-/* ---------------- compare ---------------- */
-function updateCmpAvail(){
-  const a=state.active;state.otherCam=null;
-  if(a){const n=state.tree.find(x=>x.node===a.node);
-    if(n)for(const c of n.cameras||[])if(c.cam!==a.cam&&(c.days||[]).some(d=>d.day===a.day)){state.otherCam=c.cam;break;}}
-  $('#cmpBtn').disabled=!state.otherCam;
-  if(!state.otherCam&&state.cmpOn)setCmp(false);
-}
-function setCmp(on){
-  state.cmpOn=on&&!!state.otherCam;
-  $('#cmpBtn').classList.toggle('on',state.cmpOn);
-  wrap2.hidden=!state.cmpOn;
-  $('#cam1label').hidden=!state.cmpOn;
-  if(state.hls2){state.hls2.destroy();state.hls2=null;}
-  video2.removeAttribute('src');video2.load();
-  if(state.cmpOn){
-    const a=state.active;
-    $('#cam1label').textContent=a.cam.toUpperCase();
-    $('#cam2label').textContent=state.otherCam.toUpperCase();
-    const url=`/api/hls?node=${enc(a.node)}&cam=${enc(state.otherCam)}&day=${enc(a.day)}`;
-    const H=window.Hls;
-    if(H&&H.isSupported()){state.hls2=new H();state.hls2.loadSource(url);state.hls2.attachMedia(video2);}
-    else if(video2.canPlayType('application/vnd.apple.mpegurl'))video2.src=url;
-  }
-  fitStage();
-}
-$('#cmpBtn').addEventListener('click',()=>setCmp(!state.cmpOn));
-function cmpSync(){
-  if(!state.cmpOn)return;
-  video2.playbackRate=video.playbackRate;
-  if(video.paused!==video2.paused)video.paused?video2.pause():video2.play().catch(()=>{});
-  if(video2.readyState>0&&Math.abs(video2.currentTime-video.currentTime)>0.35){
-    try{video2.currentTime=video.currentTime;}catch(e){}
+function markSelected() {
+  const key = selKey(S.sel);
+  for (const d of el.tree.querySelectorAll('.day')) {
+    d.classList.toggle('sel', d.dataset.key === key);
   }
 }
 
-/* ---------------- time mapping ---------------- */
-function segIdxAt(ct){
-  const s=state.segs;let lo=0,hi=s.length-1,ans=0;
-  while(lo<=hi){const m=(lo+hi)>>1;if(s[m].cum<=ct){ans=m;lo=m+1;}else hi=m-1;}
-  return ans;
-}
-function wallAt(ct){
-  if(!state.segs.length)return null;
-  const s=state.segs[segIdxAt(ct)];
-  return s.start_ms+(ct-s.cum)*1000+state.sync*1000;
-}
-function ctAtWall(wall){
-  const w=wall-state.sync*1000,s=state.segs;
-  let lo=0,hi=s.length-1,ans=0;
-  while(lo<=hi){const m=(lo+hi)>>1;if(s[m].start_ms<=w){ans=m;lo=m+1;}else hi=m-1;}
-  const g=s[ans];
-  return Math.max(0,Math.min(state.totalDur,g.cum+(w-g.start_ms)/1000));
-}
-function nearestSample(wall){
-  const a=state.samples;if(!a.length)return -1;
-  let lo=0,hi=a.length-1;
-  while(lo<hi){const m=(lo+hi)>>1;if(a[m].t<wall)lo=m+1;else hi=m;}
-  if(lo>0&&Math.abs(a[lo-1].t-wall)<=Math.abs(a[lo].t-wall))lo--;
-  return lo;
+/* --- selection ----------------------------------------------------------- */
+
+async function select(node, cam, day) {
+  S.sel = { node, cam, day };
+  S.clipIn = S.clipOut = null;
+  S.telemetry = [];
+  markSelected();
+  el.crumb.textContent = `${node} / ${cam} / ${day}`;
+  el.crumb.classList.remove('none');
+  el.empty.hidden = true;
+  notice('LOADING');
+
+  const q = `node=${encodeURIComponent(node)}&cam=${encodeURIComponent(cam)}&day=${encodeURIComponent(day)}`;
+  let info;
+  try {
+    info = await api(`/api/segments?${q}`);
+  } catch (e) {
+    notice(`COULD NOT LOAD THIS RECORDING<span class="hint">${e.message}</span>`);
+    return;
+  }
+  if (selKey(S.sel) !== `${node}/${cam}/${day}`) return;
+  S.segments = info.segments;
+  S.totalDur = info.total_dur;
+  updateExportLink();
+
+  const cap = hevcSupport();
+  notice(cap.ok ? '' : `<b>${cap.why}</b><span class="hint">${cap.hint || ''}</span>`);
+  attachPlayer(`/api/hls?${q}`);
+  loadTelemetry();
 }
 
-/* ---------------- OSD ---------------- */
-const C={val:WHITE,dim:DIM,acc:WHITE,ok:GREEN,bad:RED,warn:YELLOW};
-const F=(v,d=0,u='')=>(v==null||Number.isNaN(v))?'-':(typeof v==='number'?v.toFixed(d):String(v))+u;
-function block(ctx,x,y,lines,o){
-  const lh=o.lh,pad=o.pad;
-  let bw=0;for(const l of lines)bw=Math.max(bw,ctx.measureText(l.map(s=>s.t).join('')).width);
-  bw+=pad*2;const bh=lines.length*lh+pad*1.4;
-  if(o.right)x-=bw;if(o.bottom)y-=bh;
-  ctx.fillStyle='rgba(10,8,5,0.62)';ctx.fillRect(x,y,bw,bh);
-  ctx.strokeStyle='rgba(242,239,233,0.18)';ctx.lineWidth=1;ctx.strokeRect(x+.5,y+.5,bw-1,bh-1);
-  ctx.textBaseline='top';
-  lines.forEach((l,i)=>{let cx=x+pad;const cy=y+pad*0.8+i*lh;
-    for(const s of l){ctx.fillStyle=s.c||C.val;ctx.fillText(s.t,cx,cy);cx+=ctx.measureText(s.t).width;}});
-}
-function drawOsd(){
-  const dpr=devicePixelRatio||1,w=wrap.clientWidth,h=wrap.clientHeight;
-  if(!w||!h)return;
-  if(osd.width!==Math.round(w*dpr)||osd.height!==Math.round(h*dpr)){osd.width=Math.round(w*dpr);osd.height=Math.round(h*dpr);}
-  const ctx=osd.getContext('2d');
-  ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,w,h);
-  if(!state.osdOn||!state.active||!state.segs.length)return;
-  const fs=Math.max(11,Math.round(h/40));
-  ctx.font=fs+'px ui-monospace,Menlo,Consolas,monospace';
-  const o={lh:Math.round(fs*1.45),pad:Math.round(fs*0.7)};
-  const M=12,ct=video.currentTime,wall=wallAt(ct);
-  const idx=nearestSample(wall);
-  const ok=idx>=0&&Math.abs(state.samples[idx].t-wall)<=3000;
-  const d=ok?state.merged[idx]:null;
-  const dm=t=>({t,c:C.dim}),vl=(t,c)=>({t,c:c||C.val});
-  if(ok){
-    const armed=d.armed===true?vl('ARMED',C.bad):d.armed===false?vl('DISARM',C.ok):vl('-',C.dim);
-    block(ctx,M,M,[
-      [vl(d.mode!=null?String(d.mode).toUpperCase():'-',C.acc),dm('  '),armed],
-      [dm('SPD  '),vl(F(d.speed_kmh,1)),dm(' km/h')],
-      [dm('ALT  '),vl(F(d.alt_m,1)),dm(' m')],
-      [dm('HDG '),vl(F(d.heading_deg,0,'°')),dm('  P '),vl(F(d.pitch_deg,1,'°')),dm('  R '),vl(F(d.roll_deg,1,'°'))],
-    ],o);
-    const lq=d.elrs_lq_pct,lqc=lq==null?C.dim:lq>=70?C.ok:lq>=40?C.warn:C.bad;
-    block(ctx,w-M,M,[
-      [dm('BAT  '),vl(F(d.battery_v,1,'V')),dm(' '),vl(F(d.battery_pct,0,'%')),dm(' '),vl(F(d.battery_a,1,'A'))],
-      [dm('MAV  '),vl(F(d.mavlink_hz,1,'Hz')),dm(' LOSS '),vl(F(d.mavlink_loss_pct,1,'%'))],
-      [dm('LQ   '),vl(F(lq,0,'%'),lqc)],
-    ],{...o,right:true});
-    block(ctx,M,h-M,[
-      [dm('LAT  '),vl(F(d.lat,7))],
-      [dm('LON  '),vl(F(d.lon,7))],
-      [dm('GPS  '),vl(F(d.gps_fix)),dm(' S'),vl(F(d.gps_sats)),dm(' H'),vl(F(d.gps_hdop,1))],
-      [dm('HOME '),vl(F(d.home_dist_m,0,' m')),dm('  MSN '),vl(F(d.mission_dist_m,0,' m'))],
-    ],{...o,bottom:true});
-  }else{
-    block(ctx,M,M,[[vl('NO TELEMETRY',C.bad)]],o);
-  }
-  const si=segIdxAt(ct);
-  const tt=s=>{s=Math.max(0,Math.floor(s));return String(Math.floor(s/3600)).padStart(2,'0')+':'+String(Math.floor(s/60)%60).padStart(2,'0')+':'+String(s%60).padStart(2,'0');};
-  const iso=wall!=null?new Date(wall).toISOString().replace('T',' ').slice(0,19)+'Z':'-';
-  block(ctx,w-M,h-M,[
-    [vl(iso,C.acc)],
-    [dm('T+'),vl(tt(ct)),dm('  SEG '),vl((si+1)+'/'+state.segs.length),dm('  '),vl(video.playbackRate.toFixed(2).replace(/\.?0+$/,'')+'×',C.dim)],
-  ],{...o,right:true,bottom:true});
-}
+function attachPlayer(url) {
+  if (S.hls) { S.hls.destroy(); S.hls = null; }
+  const v = el.video;
+  v.removeAttribute('src');
+  v.load();
 
-/* ---------------- graph ---------------- */
-function seriesPoints(field,v0,v1){
-  const pts=[];
-  for(const s of state.samples){if(s.t<v0-30000||s.t>v1+30000)continue;const v=s.p[field];if(typeof v==='number')pts.push([s.t,v]);}
-  return pts;
-}
-function renderGraphBase(w,h,dpr){
-  const c=document.createElement('canvas');c.width=w*dpr;c.height=h*dpr;
-  const ctx=c.getContext('2d');ctx.setTransform(dpr,0,0,dpr,0,0);
-  ctx.fillStyle='#14100c';ctx.fillRect(0,0,w,h);
-  if(!state.view)return c;
-  const [v0,v1]=state.view,span=Math.max(1,v1-v0);
-  const X=t=>(t-v0)/span*w,padY=10,gh=h-padY*2;
-  for(const [ga,gb] of state.gaps){
-    if(gb<v0||ga>v1)continue;
-    const xa=Math.max(0,X(ga)),xb=Math.min(w,X(gb));
-    ctx.fillStyle='rgba(224,74,58,0.08)';ctx.fillRect(xa,0,xb-xa,h);
-    if(xb-xa>34){ctx.fillStyle='rgba(224,74,58,0.55)';ctx.font='9px ui-monospace,Menlo,monospace';ctx.textBaseline='top';ctx.fillText('GAP',(xa+xb)/2-9,h-12);}
-  }
-  ctx.font='9px ui-monospace,Menlo,monospace';ctx.textBaseline='bottom';
-  const steps=[10e3,30e3,60e3,120e3,300e3,600e3,1800e3,3600e3,7200e3,4*3600e3];
-  let step=steps[steps.length-1];
-  for(const s of steps)if(span/s<=w/80){step=s;break;}
-  for(let t=Math.ceil(v0/step)*step;t<v1;t+=step){
-    const x=X(t);ctx.strokeStyle='rgba(42,33,24,0.9)';ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,h);ctx.stroke();
-    const dt=new Date(t);ctx.fillStyle=FAINT;
-    let lbl=String(dt.getUTCHours()).padStart(2,'0')+':'+String(dt.getUTCMinutes()).padStart(2,'0');
-    if(step<60e3)lbl+=':'+String(dt.getUTCSeconds()).padStart(2,'0');
-    ctx.fillText(lbl,x+3,h-2);
-  }
-  ctx.strokeStyle='rgba(42,33,24,0.6)';
-  for(let i=1;i<4;i++){const y=padY+gh*i/4;ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(w,y);ctx.stroke();}
-  const labels=[];
-  for(const ch of CH){
-    if(!state.chOn.has(ch.f))continue;
-    const pts=seriesPoints(ch.f,v0,v1);
-    let max=ch.max;
-    if(!max){max=0;for(const p of pts)max=Math.max(max,p[1]);max=nice(max||1);}
-    labels.push({l:ch.l,max,c:ch.c});
-    if(!pts.length)continue;
-    ctx.strokeStyle=ch.c;ctx.lineWidth=1.25;ctx.beginPath();let pen=false,pt=0;
-    for(const[t,v]of pts){
-      const x=X(t),y=padY+gh-Math.max(0,Math.min(1,v/max))*gh;
-      if(pen&&t-pt>15000)pen=false;
-      pen?ctx.lineTo(x,y):ctx.moveTo(x,y);pen=true;pt=t;
-    }
-    ctx.stroke();
-  }
-  ctx.textBaseline='top';
-  labels.forEach((L,i)=>{ctx.fillStyle=L.c;ctx.fillText(L.max+' '+L.l,4,4+i*11);});
-  for(const m of state.markers){
-    if(m.t<v0||m.t>v1)continue;
-    const x=X(m.t);
-    ctx.strokeStyle=m.c;ctx.lineWidth=1;
-    ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,9);ctx.stroke();
-    ctx.fillStyle=m.c;ctx.fillRect(x-2,0,4,4);
-  }
-  if(!state.samples.length){
-    ctx.fillStyle=FAINT;ctx.font='11px ui-monospace,Menlo,monospace';
-    ctx.fillText(state.telemFail?'TELEMETRY UNAVAILABLE':'NO TELEMETRY FOR THIS SPAN',w/2-90,h/2-6);
-  }
-  return c;
-}
-let gW=0,gH=0;
-function drawGraph(){
-  const dpr=devicePixelRatio||1,w=gc.clientWidth,h=gc.clientHeight;
-  if(!w||!h)return;
-  if(gc.width!==Math.round(w*dpr)||gc.height!==Math.round(h*dpr)){gc.width=Math.round(w*dpr);gc.height=Math.round(h*dpr);state.graphBase=null;}
-  if(!state.graphBase||gW!==w||gH!==h){state.graphBase=renderGraphBase(w,h,dpr);gW=w;gH=h;}
-  const ctx=gc.getContext('2d');ctx.setTransform(1,0,0,1,0,0);
-  ctx.drawImage(state.graphBase,0,0);
-  ctx.setTransform(dpr,0,0,dpr,0,0);
-  if(!state.view){ctx.fillStyle=FAINT;ctx.font='11px ui-monospace,Menlo,monospace';ctx.fillText('NO RECORDING LOADED',12,h/2-5);return;}
-  const [v0,v1]=state.view,span=Math.max(1,v1-v0),X=t=>(t-v0)/span*w;
-  for(const [wv,lbl] of [[state.inW,'IN'],[state.outW,'OUT']]){
-    if(wv==null||wv<v0||wv>v1)continue;
-    const x=X(wv);
-    ctx.strokeStyle=WHITE;ctx.setLineDash([3,3]);ctx.lineWidth=1;
-    ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,h);ctx.stroke();ctx.setLineDash([]);
-    ctx.fillStyle=WHITE;ctx.font='9px ui-monospace,Menlo,monospace';ctx.textBaseline='top';
-    ctx.fillText(lbl,x+3,12);
-  }
-  if(state.inW!=null&&state.outW!=null&&state.outW>state.inW){
-    const xa=Math.max(0,X(state.inW)),xb=Math.min(w,X(state.outW));
-    ctx.fillStyle='rgba(242,239,233,0.05)';ctx.fillRect(xa,0,xb-xa,h);
-  }
-  if(state.drag){
-    const [a,b]=state.drag,xa=Math.min(a,b),xb=Math.max(a,b);
-    ctx.fillStyle='rgba(242,239,233,0.08)';ctx.fillRect(xa,0,xb-xa,h);
-    ctx.strokeStyle='rgba(242,239,233,0.4)';ctx.strokeRect(xa+.5,.5,xb-xa-1,h-1);
-  }
-  const wall=wallAt(video.currentTime);
-  if(wall!=null&&wall>=v0&&wall<=v1){
-    const x=X(wall);
-    ctx.strokeStyle=WHITE;ctx.lineWidth=1.5;
-    ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,h);ctx.stroke();
-    ctx.fillStyle=WHITE;
-    ctx.beginPath();ctx.moveTo(x-4,0);ctx.lineTo(x+4,0);ctx.lineTo(x,6);ctx.closePath();ctx.fill();
-  }
-  if(state.hover!=null&&!state.drag){
-    const hx=state.hover,ht=v0+hx/w*span;
-    ctx.strokeStyle='rgba(242,239,233,0.25)';ctx.lineWidth=1;
-    ctx.beginPath();ctx.moveTo(hx,0);ctx.lineTo(hx,h);ctx.stroke();
-    const lines=[tfmt(ht)];
-    const mk=state.markers.find(m=>Math.abs(X(m.t)-hx)<6);
-    if(mk)lines.push('▪ '+mk.l);
-    const idx=nearestSample(ht);
-    if(idx>=0&&Math.abs(state.samples[idx].t-ht)<=5000){
-      const d=state.merged[idx];
-      for(const ch of CH){if(!state.chOn.has(ch.f))continue;
-        const v=d[ch.f];lines.push(ch.l.split(' ')[0]+' '+(typeof v==='number'?v.toFixed(ch.fix):'-'));}
-    }
-    ctx.font='10px ui-monospace,Menlo,monospace';
-    let bw=0;for(const L of lines)bw=Math.max(bw,ctx.measureText(L).width);
-    bw+=12;const bh=lines.length*13+8;
-    let bx=hx+8;if(bx+bw>w-4)bx=hx-8-bw;
-    let by=Math.max(4,Math.min(h-bh-4,14));
-    ctx.fillStyle='rgba(10,8,5,0.88)';ctx.fillRect(bx,by,bw,bh);
-    ctx.strokeStyle='rgba(242,239,233,0.25)';ctx.strokeRect(bx+.5,by+.5,bw-1,bh-1);
-    ctx.textBaseline='top';
-    lines.forEach((L,i)=>{
-      ctx.fillStyle=i===0?WHITE:(mk&&i===1?mk.c:DIM);
-      if(i>0&&(!mk||i>1)){const ch=CH.filter(x=>state.chOn.has(x.f))[i-(mk?2:1)];if(ch)ctx.fillStyle=ch.c;}
-      ctx.fillText(L,bx+6,by+4+i*13);
+  if (window.Hls && window.Hls.isSupported()) {
+    const hls = new window.Hls({ enableWorker: true, backBufferLength: 90, maxBufferLength: 30 });
+    S.hls = hls;
+    hls.on(window.Hls.Events.ERROR, (_evt, data) => {
+      if (!data.fatal) return;
+      const detail = `${data.type} / ${data.details}`;
+      if (data.type === window.Hls.ErrorTypes.NETWORK_ERROR) {
+        notice(`NETWORK ERROR, RETRYING<span class="hint">${detail}</span>`);
+        hls.startLoad();
+      } else if (data.type === window.Hls.ErrorTypes.MEDIA_ERROR) {
+        notice(`MEDIA ERROR, RECOVERING<span class="hint">${detail}</span>`);
+        hls.recoverMediaError();
+      } else {
+        notice(`PLAYBACK FAILED<span class="hint">${detail}</span>`);
+        hls.destroy();
+        S.hls = null;
+      }
     });
+    hls.on(window.Hls.Events.MANIFEST_PARSED, () => {
+      notice('');
+      v.play().catch(() => {});
+    });
+    hls.loadSource(url);
+    hls.attachMedia(v);
+  } else if (v.canPlayType('application/vnd.apple.mpegurl')) {
+    v.src = url;                                   // Safari plays HLS natively
+    v.play().catch(() => {});
+  } else {
+    notice('<b>This browser cannot play HLS.</b><span class="hint">Use Chrome, or EXPORT the recording.</span>');
   }
+  v.playbackRate = parseFloat(el.rate.value);
+  v.controls = true;
 }
-function setView(a,b){
-  const [t0,t1]=state.range;
-  let va=Math.max(t0,Math.min(a,b)),vb=Math.min(t1,Math.max(a,b));
-  if(vb-va<5000){const c=(va+vb)/2;va=c-2500;vb=c+2500;}
-  state.view=[va,vb];state.graphBase=null;
-}
-let gMouse=null;
-gc.addEventListener('pointerdown',e=>{
-  if(!state.view)return;
-  gc.setPointerCapture(e.pointerId);
-  gMouse={x0:e.offsetX,moved:false};
-});
-gc.addEventListener('pointermove',e=>{
-  state.hover=e.offsetX;
-  if(gMouse&&Math.abs(e.offsetX-gMouse.x0)>4){gMouse.moved=true;state.drag=[gMouse.x0,e.offsetX];}
-});
-gc.addEventListener('pointerup',e=>{
-  if(!gMouse)return;
-  const w=gc.clientWidth,[v0,v1]=state.view,span=v1-v0;
-  if(gMouse.moved&&state.drag){
-    const ta=v0+Math.min(...state.drag)/w*span,tb=v0+Math.max(...state.drag)/w*span;
-    if(tb-ta>1000)setView(ta,tb);
-  }else if(state.segs.length){
-    let t=v0+e.offsetX/w*span;
-    const mk=state.markers.find(m=>Math.abs((m.t-v0)/span*w-e.offsetX)<6);
-    if(mk)t=mk.t;
-    try{video.currentTime=ctAtWall(t);}catch(err){}
-  }
-  gMouse=null;state.drag=null;
-});
-gc.addEventListener('pointerleave',()=>{state.hover=null;});
-gc.addEventListener('dblclick',()=>{if(state.range)setView(...state.range);});
-gc.addEventListener('wheel',e=>{
-  if(!state.view)return;e.preventDefault();
-  const w=gc.clientWidth,[v0,v1]=state.view,span=v1-v0;
-  const ct=v0+e.offsetX/w*span,f=e.deltaY>0?1.25:0.8;
-  setView(ct-(ct-v0)*f,ct+(v1-ct)*f);
-},{passive:false});
 
-/* ---------------- legend ---------------- */
-function renderLegend(){
-  $('#legend').innerHTML=CH.map(c=>`<button type="button" class="lgd${state.chOn.has(c.f)?' on':''}" data-f="${c.f}" style="--c:${c.c}">— ${c.l}</button>`).join('');
-}
-$('#legend').addEventListener('click',e=>{
-  const b=e.target.closest('.lgd');if(!b)return;
-  const f=b.dataset.f;
-  state.chOn.has(f)?state.chOn.delete(f):state.chOn.add(f);
-  state.graphBase=null;renderLegend();
-});
-renderLegend();
+/* --- telemetry ----------------------------------------------------------- */
 
-/* ---------------- track map ---------------- */
-function renderMapBase(w,h,dpr){
-  const c=document.createElement('canvas');c.width=w*dpr;c.height=h*dpr;
-  const ctx=c.getContext('2d');ctx.setTransform(dpr,0,0,dpr,0,0);
-  ctx.fillStyle='#0f0c08';ctx.fillRect(0,0,w,h);
-  const pts=[];
-  const step=Math.max(1,Math.floor(state.samples.length/2000));
-  for(let i=0;i<state.samples.length;i+=step){
-    const p=state.samples[i].p;
-    if(typeof p.lat==='number'&&typeof p.lon==='number')pts.push([p.lat,p.lon]);
+async function loadTelemetry() {
+  if (!S.segments.length) return;
+  const key = selKey(S.sel);
+  const first = S.segments[0];
+  const last = S.segments[S.segments.length - 1];
+  const start = Math.floor(first.start_ms - 1000);
+  const end = Math.ceil(last.start_ms + last.dur * 1000 + 1000);
+  try {
+    const d = await api(`/api/telemetry?node=${encodeURIComponent(S.sel.node)}&start=${start}&end=${end}`);
+    if (selKey(S.sel) !== key) return;            // selection changed while loading
+    S.telemetry = d.samples;
+  } catch {
+    S.telemetry = [];
   }
-  if(pts.length<2){state.mapProj=null;
-    ctx.fillStyle=FAINT;ctx.font='10px ui-monospace,Menlo,monospace';ctx.fillText('NO GPS TRACK',w/2-38,h/2-5);return c;}
-  let la0=90,la1=-90,lo0=180,lo1=-180;
-  for(const[la,lo]of pts){la0=Math.min(la0,la);la1=Math.max(la1,la);lo0=Math.min(lo0,lo);lo1=Math.max(lo1,lo);}
-  const cosl=Math.cos((la0+la1)/2*Math.PI/180);
-  const dx=(lo1-lo0)*cosl||1e-9,dy=(la1-la0)||1e-9,pad=14;
-  const k=Math.min((w-pad*2)/dx,(h-pad*2)/dy);
-  const ox=(w-dx*k)/2,oy=(h-dy*k)/2;
-  const proj=(la,lo)=>[ox+(lo-lo0)*cosl*k,h-oy-(la-la0)*k];
-  state.mapProj=proj;
-  ctx.strokeStyle='rgba(42,33,24,0.9)';
-  for(let i=1;i<4;i++){
-    ctx.beginPath();ctx.moveTo(w*i/4,0);ctx.lineTo(w*i/4,h);ctx.stroke();
-    ctx.beginPath();ctx.moveTo(0,h*i/4);ctx.lineTo(w,h*i/4);ctx.stroke();
-  }
-  ctx.strokeStyle=DIM;ctx.lineWidth=1.25;ctx.beginPath();
-  pts.forEach(([la,lo],i)=>{const[x,y]=proj(la,lo);i?ctx.lineTo(x,y):ctx.moveTo(x,y);});
-  ctx.stroke();
-  const[hx,hy]=proj(pts[0][0],pts[0][1]);
-  ctx.fillStyle=GREEN;ctx.fillRect(hx-3,hy-3,6,6);
-  ctx.fillStyle=FAINT;ctx.font='9px ui-monospace,Menlo,monospace';ctx.fillText('HOME',hx+6,hy-3);
-  return c;
+  el.mapPanel.hidden = !(S.showMap && S.telemetry.length);
+  drawTimeline();
 }
-let mW=0,mH=0;
-function drawMap(){
-  const panel=$('#mapPanel');
-  const show=state.mapOn&&!!state.active;
-  panel.hidden=!show;
-  if(!show)return;
-  const dpr=devicePixelRatio||1,w=mapC.clientWidth,h=mapC.clientHeight;
-  if(!w||!h)return;
-  if(mapC.width!==Math.round(w*dpr)||mapC.height!==Math.round(h*dpr)){mapC.width=Math.round(w*dpr);mapC.height=Math.round(h*dpr);state.mapBase=null;}
-  if(!state.mapBase||mW!==w||mH!==h){state.mapBase=renderMapBase(w,h,dpr);mW=w;mH=h;}
-  const ctx=mapC.getContext('2d');ctx.setTransform(1,0,0,1,0,0);
-  ctx.drawImage(state.mapBase,0,0);
-  ctx.setTransform(dpr,0,0,dpr,0,0);
-  const wall=state.segs.length?wallAt(video.currentTime):null;
-  const idx=wall!=null?nearestSample(wall):-1;
-  const coordEl=$('#mapCoord');
-  if(idx>=0&&state.mapProj){
-    const d=state.merged[idx];
-    if(typeof d.lat==='number'&&typeof d.lon==='number'){
-      const[x,y]=state.mapProj(d.lat,d.lon);
-      if(typeof d.heading_deg==='number'){
-        const a=(d.heading_deg-90)*Math.PI/180;
-        ctx.strokeStyle=WHITE;ctx.lineWidth=1.5;
-        ctx.beginPath();ctx.moveTo(x,y);ctx.lineTo(x+10*Math.cos(a),y+10*Math.sin(a));ctx.stroke();
-      }
-      ctx.fillStyle=WHITE;ctx.beginPath();ctx.arc(x,y,3.5,0,7);ctx.fill();
-      coordEl.textContent=d.lat.toFixed(5)+', '+d.lon.toFixed(5);
-      return;
+
+/** Nearest sample at or before `wallMs`, or null when the nearest is far away. */
+function sampleAt(wallMs) {
+  const a = S.telemetry;
+  if (!a.length) return null;
+  let lo = 0, hi = a.length - 1, best = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (a[mid].t <= wallMs) { best = mid; lo = mid + 1; } else { hi = mid - 1; }
+  }
+  return best < 0 || wallMs - a[best].t > 5000 ? null : a[best];
+}
+
+/* --- canvases ------------------------------------------------------------ */
+
+function fit(canvas) {
+  const r = canvas.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.max(1, Math.round(r.width * dpr));
+  const h = Math.max(1, Math.round(r.height * dpr));
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { ctx, w: r.width, h: r.height };
+}
+
+function pickStep(spanMs) {
+  const steps = [60e3, 300e3, 600e3, 1800e3, 3600e3, 7200e3, 21600e3];
+  for (const s of steps) if (spanMs / s <= 12) return s;
+  return steps[steps.length - 1];
+}
+
+function drawTimeline() {
+  const { ctx, w, h } = fit(el.tlCanvas);
+  ctx.clearRect(0, 0, w, h);
+  if (!S.segments.length || !S.totalDur) return;
+
+  ctx.fillStyle = '#0d0a06';
+  ctx.fillRect(0, 0, w, h);
+
+  // Recorded spans, laid out on PLAYBACK time so the bar matches seeking.
+  for (const s of S.segments) {
+    const x = (s.cum / S.totalDur) * w;
+    ctx.fillStyle = '#4a3a1c';
+    ctx.fillRect(x, 8, Math.max(1, (s.dur / S.totalDur) * w), h - 20);
+    if (s.disc) {                        // seam: the publisher reconnected here
+      ctx.fillStyle = '#e04a3a';
+      ctx.fillRect(x, 4, 1.5, h - 12);
     }
   }
-  coordEl.textContent='';
-}
-$('#mapToggle').addEventListener('click',e=>{
-  state.mapOn=!state.mapOn;e.currentTarget.classList.toggle('on',state.mapOn);
-});
 
-/* ---------------- clip in/out ---------------- */
-function wallRaw(){const w=wallAt(video.currentTime);return w==null?null:w-state.sync*1000;}
-function setIn(){const w=wallRaw();if(w==null)return;state.inW=w;if(state.outW!=null&&state.outW<=w)state.outW=null;updateClipUI();}
-function setOut(){const w=wallRaw();if(w==null)return;state.outW=w;if(state.inW!=null&&state.inW>=w)state.inW=null;updateClipUI();}
-function updateClipUI(){
-  const a=state.active;
-  $('#setIn').classList.toggle('set',state.inW!=null);
-  $('#setOut').classList.toggle('set',state.outW!=null);
-  $('#clipLbl').textContent=(state.inW!=null?'IN '+tfmt(state.inW):'')+(state.inW!=null&&state.outW!=null?' ':'')+(state.outW!=null?'OUT '+tfmt(state.outW):'');
-  const ready=a&&state.inW!=null&&state.outW!=null&&state.outW>state.inW;
-  $('#clipBtn').hidden=!ready;
-  $('#clipClear').hidden=state.inW==null&&state.outW==null;
-  if(ready)$('#clipBtn').href=`/api/export?node=${enc(a.node)}&cam=${enc(a.cam)}&day=${enc(a.day)}&start_ms=${Math.round(state.inW)}&end_ms=${Math.round(state.outW)}`;
-}
-$('#setIn').addEventListener('click',setIn);
-$('#setOut').addEventListener('click',setOut);
-$('#clipClear').addEventListener('click',()=>{state.inW=null;state.outW=null;updateClipUI();});
-
-/* ---------------- top bar controls ---------------- */
-$('#osdToggle').addEventListener('click',e=>{
-  state.osdOn=!state.osdOn;e.currentTarget.classList.toggle('on',state.osdOn);
-});
-$('#sync').addEventListener('input',e=>{
-  state.sync=parseFloat(e.target.value);
-  $('#syncVal').textContent=(state.sync>=0?'+':'')+state.sync.toFixed(1)+'s';
-});
-$('#rate').addEventListener('change',e=>{video.playbackRate=parseFloat(e.target.value);});
-function cycleRate(){
-  const i=RATES.indexOf(video.playbackRate);
-  const r=RATES[(i+1+RATES.length)%RATES.length]||1;
-  video.playbackRate=r;$('#rate').value=String(r);
-}
-$('#copyBtn').addEventListener('click',e=>{
-  const w=wallAt(video.currentTime);if(w==null)return;
-  const idx=nearestSample(w);
-  const d=idx>=0?state.merged[idx]:{};
-  const iso=new Date(w).toISOString().replace('T',' ').slice(0,19)+'Z';
-  const txt=iso+(typeof d.lat==='number'?'  '+d.lat.toFixed(7)+', '+d.lon.toFixed(7):'');
-  navigator.clipboard&&navigator.clipboard.writeText(txt);
-  const b=e.currentTarget,old=b.textContent;b.textContent='COPIED';setTimeout(()=>b.textContent=old,900);
-});
-$('#frameBtn').addEventListener('click',()=>{
-  const a=state.active;if(!a)return;
-  const c=document.createElement('canvas');
-  c.width=video.videoWidth||1280;c.height=video.videoHeight||720;
-  const ctx=c.getContext('2d');
-  ctx.fillStyle='#000';ctx.fillRect(0,0,c.width,c.height);
-  try{ctx.drawImage(video,0,0,c.width,c.height);}catch(e){}
-  try{ctx.drawImage(osd,0,0,c.width,c.height);}catch(e){}
-  const w=wallAt(video.currentTime);
-  const name=`${a.node}_${a.cam}_${w!=null?new Date(w).toISOString().replace(/[:.]/g,'-').slice(0,19):'frame'}.png`;
-  c.toBlob(b=>{if(!b)return;const u=URL.createObjectURL(b);const l=document.createElement('a');l.href=u;l.download=name;l.click();setTimeout(()=>URL.revokeObjectURL(u),3000);});
-});
-$('#keysBtn').addEventListener('click',()=>{$('#keys').hidden=false;});
-$('#keys').addEventListener('click',()=>{$('#keys').hidden=true;});
-
-function updateSegInfo(){
-  const el=$('#segInfo');
-  if(!state.segs.length){el.hidden=true;return;}
-  el.hidden=false;
-  const i=segIdxAt(video.currentTime),s=state.segs[i];
-  $('#segLabel').textContent='SEG '+String(i+1).padStart(3,'0')+' · '+tfmt(s.start_ms);
-  $('#segDl').href='/seg?path='+enc(s.path)+'&download=1';
-}
-function updateBuf(){
-  const el=$('#buf');
-  if(video.readyState===0){el.textContent='BUF —';el.className='mono';return;}
-  let v=0;
-  try{const b=video.buffered,ct=video.currentTime;
-    for(let i=0;i<b.length;i++)if(ct>=b.start(i)-0.5&&ct<=b.end(i)){v=b.end(i)-ct;break;}}catch(e){}
-  el.textContent='BUF '+v.toFixed(1)+'s';
-  el.className='mono '+(v>5?'ok':v>2?'warn':'bad');
-}
-
-/* ---------------- hotkeys ---------------- */
-addEventListener('keydown',e=>{
-  if(e.target.matches&&e.target.matches('input,select,textarea'))return;
-  if(e.target===video||e.target===video2)return;
-  if(!$('#keys').hidden){$('#keys').hidden=true;return;}
-  const k=e.key;
-  const seek=d=>{if(!state.segs.length)return;try{video.currentTime=Math.max(0,Math.min(state.totalDur,video.currentTime+d));}catch(err){}};
-  const toggle=()=>{video.paused?video.play().catch(()=>{}):video.pause();};
-  if(k===' '){e.preventDefault();toggle();}
-  else if(k==='ArrowLeft'){e.preventDefault();seek(e.shiftKey?-60:-5);}
-  else if(k==='ArrowRight'){e.preventDefault();seek(e.shiftKey?60:5);}
-  else if(k==='['){const i=segIdxAt(video.currentTime);if(state.segs[i-1])try{video.currentTime=state.segs[i-1].cum;}catch(err){}}
-  else if(k===']'){const i=segIdxAt(video.currentTime);if(state.segs[i+1])try{video.currentTime=state.segs[i+1].cum;}catch(err){}}
-  else if(k==='j'||k==='J')seek(-10);
-  else if(k==='k'||k==='K')toggle();
-  else if(k==='l'||k==='L')cycleRate();
-  else if(k===','){video.pause();seek(-1/25);}
-  else if(k==='.'){video.pause();seek(1/25);}
-  else if(k==='i'||k==='I')setIn();
-  else if(k==='o'||k==='O')setOut();
-  else if(k==='?')$('#keys').hidden=false;
-});
-
-/* ---------------- layout / loop ---------------- */
-function fitStage(){
-  const panes=state.cmpOn?2:1,gap=12;
-  const bw=(stage.clientWidth-24-(panes-1)*gap)/panes,bh=stage.clientHeight-24;
-  let w=bw,h=bw*9/16;
-  if(h>bh){h=bh;w=h*16/9;}
-  for(const el of[wrap,wrap2]){el.style.width=Math.floor(w)+'px';el.style.height=Math.floor(h)+'px';}
-}
-new ResizeObserver(fitStage).observe(stage);
-fitStage();
-(function loop(){
-  drawOsd();drawGraph();drawMap();
-  if(state.segs.length){
-    updateSegInfo();updateBuf();cmpSync();
-    if(performance.now()-lastHash>2000){lastHash=performance.now();writeHash();}
+  if (S.clipIn != null && S.clipOut != null) {
+    const a = (playbackAt(S.clipIn) / S.totalDur) * w;
+    const b = (playbackAt(S.clipOut) / S.totalDur) * w;
+    ctx.fillStyle = 'rgba(224,176,47,.28)';
+    ctx.fillRect(Math.min(a, b), 8, Math.abs(b - a), h - 20);
   }
-  requestAnimationFrame(loop);
-})();
+  for (const m of [S.clipIn, S.clipOut]) {
+    if (m == null) continue;
+    ctx.fillStyle = '#e0b02f';
+    ctx.fillRect((playbackAt(m) / S.totalDur) * w - 1, 4, 2, h - 12);
+  }
+
+  ctx.fillStyle = '#5a5044';
+  ctx.font = '9px ui-monospace, monospace';
+  const startWall = S.segments[0].start_ms;
+  const endWall = wallAt(S.totalDur);
+  const step = pickStep(endWall - startWall);
+  for (let t = Math.ceil(startWall / step) * step; t <= endWall; t += step) {
+    const x = (playbackAt(t) / S.totalDur) * w;
+    ctx.fillRect(x, h - 10, 1, 4);
+    ctx.fillText(hhmmss(t).slice(0, 5), x + 3, h - 2);
+  }
+}
+
+function drawOsd() {
+  const { ctx, w, h } = fit(el.osd);
+  ctx.clearRect(0, 0, w, h);
+  if (!S.showOsd || !S.segments.length) return;
+  const wall = wallAt(el.video.currentTime);
+  const s = sampleAt(wall);
+  const p = (s && s.p) || {};
+  const m = 14;
+
+  ctx.font = '600 13px ui-monospace, monospace';
+  ctx.textBaseline = 'top';
+  ctx.shadowColor = 'rgba(0,0,0,.9)';
+  ctx.shadowBlur = 4;
+
+  ctx.fillStyle = '#f0ece3';
+  ctx.fillText(`${S.sel.day} ${hhmmss(wall)}Z`, m, m);
+  ctx.fillStyle = '#8a7d6a';
+  ctx.fillText(`${S.sel.node} / ${S.sel.cam}`, m, m + 18);
+
+  if (!s) {
+    ctx.fillStyle = '#5a5044';
+    ctx.fillText('NO TELEMETRY', m, m + 40);
+    ctx.shadowBlur = 0;
+    return;
+  }
+
+  const rows = [
+    ['SPD', p.speed_kmh != null ? `${p.speed_kmh.toFixed(1)} km/h` : null],
+    ['ALT', p.alt_m != null ? `${p.alt_m.toFixed(1)} m` : null],
+    ['HDG', p.heading_deg != null ? `${Math.round(p.heading_deg)} deg` : null],
+  ].filter((r) => r[1]);
+  let y = h - m - rows.length * 18;
+  for (const [k, v] of rows) {
+    ctx.fillStyle = '#8a7d6a'; ctx.fillText(k, m, y);
+    ctx.fillStyle = '#f0ece3'; ctx.fillText(v, m + 40, y);
+    y += 18;
+  }
+
+  const right = [];
+  if (p.battery_v != null) right.push(`${p.battery_v.toFixed(1)}V`);
+  if (p.battery_pct != null) right.push(`${Math.round(p.battery_pct)}%`);
+  if (p.gps_sats != null) right.push(`SAT ${p.gps_sats}`);
+  if (p.gps_fix) right.push(String(p.gps_fix));
+  if (p.mode) right.push(String(p.mode));
+  ctx.textAlign = 'right';
+  let ry = m;
+  for (const line of right) { ctx.fillStyle = '#f0ece3'; ctx.fillText(line, w - m, ry); ry += 18; }
+  if (p.lat != null && p.lon != null) {
+    ctx.fillStyle = '#8a7d6a';
+    ctx.fillText(`${p.lat.toFixed(6)} ${p.lon.toFixed(6)}`, w - m, h - m - 16);
+  }
+  ctx.textAlign = 'left';
+  ctx.shadowBlur = 0;
+}
+
+function drawMap() {
+  if (el.mapPanel.hidden) return;
+  const { ctx, w, h } = fit(el.map);
+  ctx.clearRect(0, 0, w, h);
+  const pts = [];
+  for (const s of S.telemetry) {
+    const p = s.p || {};
+    if (typeof p.lat === 'number' && typeof p.lon === 'number' && (p.lat || p.lon)) pts.push(p);
+  }
+  if (pts.length < 2) {
+    ctx.fillStyle = '#5a5044';
+    ctx.font = '10px ui-monospace, monospace';
+    ctx.fillText('NO POSITION DATA', 10, 20);
+    el.mapCoord.textContent = '';
+    return;
+  }
+  let minLa = Infinity, maxLa = -Infinity, minLo = Infinity, maxLo = -Infinity;
+  for (const p of pts) {
+    minLa = Math.min(minLa, p.lat); maxLa = Math.max(maxLa, p.lat);
+    minLo = Math.min(minLo, p.lon); maxLo = Math.max(maxLo, p.lon);
+  }
+  // A degree of longitude shrinks with latitude; without this the track is
+  // stretched sideways and the shape lies.
+  const midLa = (minLa + maxLa) / 2;
+  const midLo = (minLo + maxLo) / 2;
+  const kx = Math.cos((midLa * Math.PI) / 180) || 1;
+  const sc = Math.min(
+    (w - 24) / Math.max((maxLo - minLo) * kx, 1e-6),
+    (h - 24) / Math.max(maxLa - minLa, 1e-6),
+  );
+  const X = (lo) => w / 2 + (lo - midLo) * kx * sc;
+  const Y = (la) => h / 2 - (la - midLa) * sc;
+
+  ctx.strokeStyle = '#6b5a33';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  pts.forEach((p, i) => (i ? ctx.lineTo(X(p.lon), Y(p.lat)) : ctx.moveTo(X(p.lon), Y(p.lat))));
+  ctx.stroke();
+
+  const s = sampleAt(wallAt(el.video.currentTime));
+  if (s && s.p && typeof s.p.lat === 'number' && typeof s.p.lon === 'number') {
+    ctx.fillStyle = '#e0b02f';
+    ctx.beginPath();
+    ctx.arc(X(s.p.lon), Y(s.p.lat), 4, 0, Math.PI * 2);
+    ctx.fill();
+    el.mapCoord.textContent = `${s.p.lat.toFixed(5)} ${s.p.lon.toFixed(5)}`;
+  } else {
+    el.mapCoord.textContent = '';
+  }
+}
+
+function drawGraph() {
+  const { ctx, w, h } = fit(el.graph);
+  ctx.clearRect(0, 0, w, h);
+  if (!S.segments.length) return;
+  const t0 = S.segments[0].start_ms;
+  const span = Math.max(1, wallAt(S.totalDur) - t0);
+
+  const legend = [];
+  for (const s of [
+    { key: 'speed_kmh', color: '#6fcf7a', label: 'SPD' },
+    { key: 'alt_m', color: '#e0b02f', label: 'ALT' },
+  ]) {
+    const pts = [];
+    for (const smp of S.telemetry) {
+      const v = smp.p && smp.p[s.key];
+      if (typeof v === 'number') pts.push([smp.t, v]);
+    }
+    if (pts.length < 2) continue;
+    let lo = Infinity, hi = -Infinity;
+    for (const [, v] of pts) { lo = Math.min(lo, v); hi = Math.max(hi, v); }
+    if (hi - lo < 1e-6) hi = lo + 1;
+    ctx.strokeStyle = s.color;
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    pts.forEach(([t, v], i) => {
+      const x = ((t - t0) / span) * w;
+      const y = h - 8 - ((v - lo) / (hi - lo)) * (h - 20);
+      i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+    });
+    ctx.stroke();
+    legend.push(`<span style="color:${s.color}">${s.label} ${lo.toFixed(0)}..${hi.toFixed(0)}</span>`);
+  }
+  el.legend.innerHTML = legend.join(' &nbsp; ') ||
+    (S.telemetry.length ? 'NO NUMERIC SERIES' : 'NO TELEMETRY');
+
+  ctx.fillStyle = '#e0b02f';
+  ctx.fillRect(((wallAt(el.video.currentTime) - t0) / span) * w - 0.5, 0, 1, h);
+}
+
+/* --- per-frame ----------------------------------------------------------- */
+
+function tick() {
+  if (S.segments.length) {
+    const t = el.video.currentTime;
+    const wall = wallAt(t);
+    el.clock.innerHTML =
+      `${hhmmss(wall)}<span class="ms">.${pad(Math.floor(new Date(wall).getUTCMilliseconds() / 10))}</span>`;
+    el.rel.textContent = `${hms(t)} / ${hms(S.totalDur)}`;
+    const seg = segmentAt(t);
+    if (seg) {
+      el.segNow.textContent = seg.path.split('/').pop();
+      el.dlSeg.href = `/raw?path=${encodeURIComponent(seg.path)}&download=1`;
+      el.dlSeg.hidden = false;
+    }
+    if (S.totalDur > 0) {
+      el.tlHead.hidden = false;
+      el.tlHead.style.left = `${(t / S.totalDur) * el.timeline.clientWidth}px`;
+    }
+    drawOsd();
+    drawMap();
+    drawGraph();
+  }
+  requestAnimationFrame(tick);
+}
+
+/* --- clip and export ----------------------------------------------------- */
+
+/** Segments the current export range covers. */
+function rangeSegments() {
+  if (S.clipIn == null || S.clipOut == null || S.clipOut <= S.clipIn) return S.segments;
+  return S.segments.filter(
+    (s) => s.start_ms < S.clipOut && s.start_ms + s.dur * 1000 > S.clipIn);
+}
+
+/** First point where the video mode changes inside the range, if any. A stream
+ *  copy cannot join those, so the export is refused server side; catching it
+ *  here means the operator learns before starting a download, not after. */
+function modeChange() {
+  const segs = rangeSegments();
+  for (let i = 1; i < segs.length; i++) {
+    if (segs[i].par && segs[i - 1].par && segs[i].par !== segs[i - 1].par) {
+      return { at: segs[i].start_ms, from: segs[i - 1].par, to: segs[i].par, index: i };
+    }
+  }
+  return null;
+}
+
+function updateExportLink() {
+  el.inBtn.disabled = el.outBtn.disabled = !S.segments.length;
+  if (!S.sel || !S.segments.length) { el.exportBtn.hidden = true; return; }
+  const q = new URLSearchParams({ node: S.sel.node, cam: S.sel.cam, day: S.sel.day });
+  let label = 'EXPORT DAY';
+  if (S.clipIn != null && S.clipOut != null && S.clipOut > S.clipIn) {
+    q.set('start_ms', String(Math.floor(S.clipIn)));
+    q.set('end_ms', String(Math.floor(S.clipOut)));
+    label = `EXPORT ${hms((S.clipOut - S.clipIn) / 1000)}`;
+  }
+  const mc = modeChange();
+  el.exportBtn.href = mc ? '#' : `/api/export?${q.toString()}`;
+  el.exportBtn.textContent = mc ? 'EXPORT BLOCKED' : label;
+  el.exportBtn.classList.toggle('go', !mc);
+  el.exportBtn.title = mc
+    ? `Video mode changes at ${hhmmss(mc.at)} (${mc.from} -> ${mc.to}). Click to clip up to it.`
+    : '';
+  el.exportBtn.hidden = false;
+
+  const parts = [];
+  if (S.clipIn != null) parts.push(`IN ${hhmmss(S.clipIn)}`);
+  if (S.clipOut != null) parts.push(`OUT ${hhmmss(S.clipOut)}`);
+  el.clipLbl.textContent = parts.join('  ');
+  el.clipClr.hidden = !parts.length;
+  drawTimeline();
+}
+
+/* --- input --------------------------------------------------------------- */
+
+const seekPlayback = (t) => {
+  el.video.currentTime = Math.max(0, Math.min(Math.max(0, S.totalDur - 0.05), t));
+};
+
+el.timeline.addEventListener('click', (e) => {
+  if (!S.totalDur) return;
+  const r = el.timeline.getBoundingClientRect();
+  seekPlayback(((e.clientX - r.left) / r.width) * S.totalDur);
+});
+
+el.graph.addEventListener('click', (e) => {
+  if (!S.segments.length) return;
+  const r = el.graph.getBoundingClientRect();
+  const t0 = S.segments[0].start_ms;
+  const span = Math.max(1, wallAt(S.totalDur) - t0);
+  seekPlayback(playbackAt(t0 + ((e.clientX - r.left) / r.width) * span));
+});
+
+const setIn = () => { S.clipIn = wallAt(el.video.currentTime); updateExportLink(); };
+const setOut = () => { S.clipOut = wallAt(el.video.currentTime); updateExportLink(); };
+
+el.osdBtn.onclick = () => { S.showOsd = !S.showOsd; el.osdBtn.classList.toggle('on', S.showOsd); };
+el.mapBtn.onclick = () => {
+  S.showMap = !S.showMap;
+  el.mapBtn.classList.toggle('on', S.showMap);
+  el.mapPanel.hidden = !(S.showMap && S.telemetry.length);
+};
+el.rate.onchange = () => { el.video.playbackRate = parseFloat(el.rate.value); };
+el.inBtn.onclick = setIn;
+el.outBtn.onclick = setOut;
+el.clipClr.onclick = () => { S.clipIn = S.clipOut = null; updateExportLink(); };
+el.keysBtn.onclick = () => { el.keys.hidden = !el.keys.hidden; };
+el.keys.onclick = () => { el.keys.hidden = true; };
+
+document.addEventListener('keydown', (e) => {
+  if (e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement) return;
+  const v = el.video;
+  const step = e.shiftKey ? 60 : 5;
+  switch (e.key) {
+    case ' ': case 'k': e.preventDefault(); v.paused ? v.play() : v.pause(); break;
+    case 'ArrowLeft': seekPlayback(v.currentTime - step); break;
+    case 'ArrowRight': seekPlayback(v.currentTime + step); break;
+    case '[': { const s = segmentAt(v.currentTime); if (s) seekPlayback(s.cum - 0.01); break; }
+    case ']': { const s = segmentAt(v.currentTime); if (s) seekPlayback(s.cum + s.dur + 0.01); break; }
+    case ',': if (v.paused) seekPlayback(v.currentTime - 0.04); break;
+    case '.': if (v.paused) seekPlayback(v.currentTime + 0.04); break;
+    case 'i': setIn(); break;
+    case 'o': setOut(); break;
+    case '?': el.keys.hidden = !el.keys.hidden; break;
+    case 'Escape': el.keys.hidden = true; break;
+  }
+});
+
+window.addEventListener('resize', drawTimeline);
+
+/* --- boot ---------------------------------------------------------------- */
+
+const boot = hevcSupport();
+if (!boot.ok) notice(`<b>${boot.why}</b><span class="hint">${boot.hint || ''}</span>`);
 loadTree();
-setInterval(loadTree,30000);
+setInterval(loadTree, 60000);
+requestAnimationFrame(tick);

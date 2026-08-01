@@ -167,7 +167,13 @@ configs:
           source: publisher
           record: yes
           recordPath: /rec/%path/%Y-%m-%d_%H-%M-%S-%f
-          recordFormat: mpegts
+          # fMP4, NOT mpegts. A browser can only decode H.265 as fragmented MP4
+          # with an hvc1 sample entry; HEVC inside MPEG-TS is rejected outright
+          # by hls.js ("Unsupported HEVC in M2TS found"), so every mpegts
+          # recording was unplayable in the viewer. fMP4 also lets MediaMTX's own
+          # playback server read the archive, which mpegts does not.
+          # Legacy .ts segments stay readable: the viewer remuxes them on the fly.
+          recordFormat: fmp4
           recordSegmentDuration: 10m
           recordDeleteAfter: 720h
   diskring_sh:
